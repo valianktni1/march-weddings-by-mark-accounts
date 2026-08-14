@@ -1,0 +1,54 @@
+# Local development only. Use docker-compose-truenas.yml for staging/production.
+services:
+  mongodb:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: accountsadmin
+      MONGO_INITDB_ROOT_PASSWORD: local-development-password
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --username accountsadmin --password local-development-password --authenticationDatabase admin --eval \"db.adminCommand('ping').ok\" | grep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    environment:
+      APP_ENV: development
+      APP_URL: http://localhost:3000
+      ALLOWED_HOSTS: localhost,127.0.0.1
+      CORS_ORIGINS: http://localhost:3000
+      SESSION_SECRET: local-development-session-secret-change-me
+      SESSION_HOURS: "12"
+      COOKIE_SECURE: "false"
+      ADMIN_EMAIL: mark@perfectweddingsbymark.uk
+      ADMIN_PASSWORD: local-development-password
+      MONGO_URL: mongodb://accountsadmin:local-development-password@mongodb:27017/?authSource=admin
+      DB_NAME: weddings_by_mark_accounts_dev
+      GEMINI_API_KEY: ""
+      BOOKING_INTEGRATION_ENABLED: "false"
+      BOOKING_INTEGRATION_KEY: ""
+    volumes:
+      - uploads_data:/app/uploads
+      - backups_data:/app/temp_backup
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        REACT_APP_BACKEND_URL: ""
+    ports:
+      - 3000:80
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  mongodb_data:
+  uploads_data:
+  backups_data:

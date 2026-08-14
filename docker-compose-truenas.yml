@@ -1,0 +1,77 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: wbm-accounts-v2-db
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: accountsadmin
+      MONGO_INITDB_ROOT_PASSWORD: CHANGE_TO_A_LONG_RANDOM_DATABASE_PASSWORD
+    volumes:
+      - /mnt/apps/newaccounts-v2/mongodb:/data/db
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mongosh --quiet --username accountsadmin --password "$${MONGO_INITDB_ROOT_PASSWORD}" --authenticationDatabase admin --eval "db.adminCommand('ping').ok" | grep 1
+      interval: 15s
+      timeout: 8s
+      retries: 10
+      start_period: 30s
+    networks:
+      - wbm-accounts-v2-network
+
+  backend:
+    build:
+      context: https://github.com/valianktni1/REPLACE-WITH-NEW-CLEAN-REPO.git#main:backend
+    container_name: wbm-accounts-v2-backend
+    restart: unless-stopped
+    init: true
+    environment:
+      APP_ENV: production
+      APP_URL: http://YOUR-TRUENAS-IP:30050
+      ALLOWED_HOSTS: YOUR-TRUENAS-IP,localhost,127.0.0.1
+      CORS_ORIGINS: http://YOUR-TRUENAS-IP:30050
+      SESSION_SECRET: CHANGE_TO_A_DIFFERENT_LONG_RANDOM_SESSION_SECRET
+      SESSION_HOURS: "12"
+      COOKIE_SECURE: "false"
+      ADMIN_EMAIL: mark@perfectweddingsbymark.uk
+      ADMIN_PASSWORD: CHANGE_TO_A_NEW_STRONG_ADMIN_PASSWORD
+      MONGO_URL: mongodb://accountsadmin:CHANGE_TO_A_LONG_RANDOM_DATABASE_PASSWORD@mongodb:27017/?authSource=admin
+      DB_NAME: weddings_by_mark_accounts_v2
+      MAX_RESTORE_MB: "250"
+      GEMINI_API_KEY: ""
+      BOOKING_INTEGRATION_ENABLED: "false"
+      BOOKING_INTEGRATION_KEY: ""
+    volumes:
+      - /mnt/temp-tntermediate/newaccounts-v2/data/uploads:/app/uploads
+      - /mnt/temp-tntermediate/newaccounts-v2/data/backups:/app/temp_backup
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - wbm-accounts-v2-network
+
+  frontend:
+    build:
+      context: https://github.com/valianktni1/REPLACE-WITH-NEW-CLEAN-REPO.git#main:frontend
+      args:
+        REACT_APP_BACKEND_URL: ""
+    container_name: wbm-accounts-v2-frontend
+    restart: unless-stopped
+    init: true
+    ports:
+      - 30050:80
+    depends_on:
+      backend:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - wbm-accounts-v2-network
+
+networks:
+  wbm-accounts-v2-network:
+    name: wbm-accounts-v2-network
