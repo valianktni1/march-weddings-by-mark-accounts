@@ -20,6 +20,7 @@ backend/static_frontend/
 
 # Runtime financial data - never commit these
 backend/uploads/
+backend/backups/
 backend/temp_backup/
 backend/temp_restore/
 backend/V:*/

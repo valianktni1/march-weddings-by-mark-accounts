@@ -44,7 +44,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.14-secure-foundation-v1"
+BUILD_ID = "2026.08.15-persistent-storage-v1.2"
 
 # Create the main app. Documentation is disabled in production so financial
 # API routes are not advertised publicly.
@@ -69,9 +69,15 @@ FAILED_LOGINS: Dict[str, List[float]] = {}
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_ATTEMPTS = 5
 
-# Uploads directory
-UPLOAD_DIR = ROOT_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+# All user-owned files live beneath one configurable storage root. TrueNAS
+# mounts the Nextcloud dataset at /app/storage; local development continues to
+# use the backend directory unless STORAGE_ROOT is explicitly supplied.
+STORAGE_ROOT = Path(os.environ.get("STORAGE_ROOT", str(ROOT_DIR))).resolve()
+UPLOAD_DIR = STORAGE_ROOT / "uploads"
+BACKUP_DIR = STORAGE_ROOT / "backups"
+RESTORE_DIR = STORAGE_ROOT / "temp_restore"
+for storage_dir in (UPLOAD_DIR, BACKUP_DIR, RESTORE_DIR):
+    storage_dir.mkdir(parents=True, exist_ok=True)
 
 # Owner withdrawal patterns to exclude from expenses
 OWNER_WITHDRAWAL_PATTERNS = ["HMRC", "MARK POWELL", "MARK ADAM POWELL"]
@@ -342,6 +348,23 @@ async def _read_upload(file: UploadFile, allowed_extensions: set[str], limit_mb:
     if len(content) > limit_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File exceeds {limit_mb} MB")
     return content, extension, original_name
+
+
+def _delete_managed_upload(file_path: Optional[str]) -> bool:
+    """Delete an uploaded file only when it is inside the managed upload root."""
+    if not file_path:
+        return False
+    upload_root = UPLOAD_DIR.resolve()
+    target = Path(file_path).resolve()
+    try:
+        target.relative_to(upload_root)
+    except ValueError:
+        logger.warning("Refused to delete a file outside the managed upload directory: %s", target)
+        return False
+    if target.is_file():
+        target.unlink()
+        return True
+    return False
 
 
 @app.middleware("http")
@@ -637,7 +660,7 @@ async def export_tax_prep(tax_year: str):
     csv_content = output.getvalue()
     
     # Save to temp file and return
-    temp_path = ROOT_DIR / "temp_backup" / f"tax_return_{tax_year}.csv"
+    temp_path = BACKUP_DIR / f"tax_return_{tax_year}.csv"
     temp_path.parent.mkdir(parents=True, exist_ok=True)
     with open(temp_path, "w") as f:
         f.write(csv_content)
@@ -729,7 +752,7 @@ async def export_quarter(tax_year: str, quarter: str):
             writer.writerow([e.get("date",""), e.get("description",""), e.get("category",""), e.get("supplier",""), f"{e.get('amount',0):.2f}"])
     
     csv_content = output.getvalue()
-    temp_path = ROOT_DIR / "temp_backup" / f"tax_return_{tax_year}_{quarter}.csv"
+    temp_path = BACKUP_DIR / f"tax_return_{tax_year}_{quarter}.csv"
     temp_path.parent.mkdir(parents=True, exist_ok=True)
     with open(temp_path, "w") as f:
         f.write(csv_content)
@@ -1267,9 +1290,13 @@ async def get_invoice_pdf(invoice_id: str):
 
 @api_router.delete("/invoices/{invoice_id}")
 async def delete_invoice(invoice_id: str):
+    invoice = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
     result = await db.invoices.delete_one({"id": invoice_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    _delete_managed_upload(invoice.get("file_path"))
     return {"status": "deleted"}
 
 
@@ -1663,9 +1690,13 @@ async def get_expense_file(expense_id: str):
 
 @api_router.delete("/expenses/{expense_id}")
 async def delete_expense(expense_id: str):
+    expense = await db.expenses.find_one({"id": expense_id}, {"_id": 0})
+    if not expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
     result = await db.expenses.delete_one({"id": expense_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Expense not found")
+    _delete_managed_upload(expense.get("file_path"))
     return {"status": "deleted"}
 
 
@@ -1683,12 +1714,15 @@ async def get_transactions(tax_year: Optional[str] = None):
 @api_router.delete("/bank-statements/all")
 async def delete_all_bank_data():
     """Delete all bank statements and their associated transactions"""
+    statements = await db.bank_statements.find({}, {"_id": 0, "file_path": 1}).to_list(10000)
     tx_result = await db.transactions.delete_many({"source": "bank_statement"})
     bs_result = await db.bank_statements.delete_many({})
+    files_deleted = sum(1 for statement in statements if _delete_managed_upload(statement.get("file_path")))
     return {
         "status": "deleted",
         "transactions_deleted": tx_result.deleted_count,
-        "statements_deleted": bs_result.deleted_count
+        "statements_deleted": bs_result.deleted_count,
+        "files_deleted": files_deleted,
     }
 
 @api_router.post("/bank-statements/upload")
@@ -2020,9 +2054,10 @@ async def delete_bank_statement(statement_id: str):
     # Delete all transactions from this statement
     result = await db.transactions.delete_many({"bank_statement_id": statement_id})
     deleted_txns = result.deleted_count
-    
+
     # Delete the statement itself
     await db.bank_statements.delete_one({"id": statement_id})
+    _delete_managed_upload(statement.get("file_path"))
     
     return {"status": "deleted", "transactions_removed": deleted_txns}
 
@@ -2404,7 +2439,7 @@ BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
 async def _build_backup() -> tuple[str, Dict[str, int]]:
     backup_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_name = f"weddings_by_mark_backup_{backup_id}"
-    backup_root = ROOT_DIR / "temp_backup"
+    backup_root = BACKUP_DIR
     temp_backup_dir = backup_root / backup_name
     backup_root.mkdir(parents=True, exist_ok=True)
     temp_backup_dir.mkdir(parents=True, exist_ok=False)
@@ -2463,7 +2498,7 @@ async def download_backup(filename: str):
     """Download a backup file"""
     if not BACKUP_FILENAME_RE.fullmatch(filename):
         raise HTTPException(status_code=400, detail="Invalid backup filename")
-    backup_root = (ROOT_DIR / "temp_backup").resolve()
+    backup_root = BACKUP_DIR.resolve()
     file_path = (backup_root / filename).resolve()
     if file_path.parent != backup_root:
         raise HTTPException(status_code=400, detail="Invalid backup filename")
@@ -2475,7 +2510,7 @@ async def download_backup(filename: str):
 @api_router.post("/restore")
 async def restore_backup(file: UploadFile = File(...)):
     """Safely restore a complete backup after first taking a rollback backup."""
-    restore_root = ROOT_DIR / "temp_restore"
+    restore_root = RESTORE_DIR
     restore_id = str(uuid.uuid4())
     work_root = restore_root / restore_id
     temp_zip = work_root / "restore.zip"
@@ -2564,7 +2599,7 @@ app.add_middleware(
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=[host.strip() for host in os.environ.get(
-        "ALLOWED_HOSTS", "accounts.weddingsbymark.co.uk,localhost,127.0.0.1"
+        "ALLOWED_HOSTS", "accounts2026.weddingsbymark.uk,192.168.24.10,localhost,127.0.0.1"
     ).split(",") if host.strip()],
 )
 

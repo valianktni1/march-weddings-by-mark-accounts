@@ -1,13 +1,13 @@
 services:
   mongodb:
     image: mongo:7
-    container_name: wbm-accounts-v2-db
+    container_name: accounts-2026-db
     restart: unless-stopped
     environment:
       MONGO_INITDB_ROOT_USERNAME: accountsadmin
       MONGO_INITDB_ROOT_PASSWORD: CHANGE_TO_A_LONG_RANDOM_DATABASE_PASSWORD
     volumes:
-      - /mnt/apps/newaccounts-v2/mongodb:/data/db
+      - /mnt/apps/accounts-2026-use/mongodb:/data/db
     healthcheck:
       test:
         - CMD-SHELL
@@ -17,33 +17,33 @@ services:
       retries: 10
       start_period: 30s
     networks:
-      - wbm-accounts-v2-network
+      - accounts-2026-network
 
   backend:
     build:
-      context: https://github.com/valianktni1/REPLACE-WITH-NEW-CLEAN-REPO.git#main:backend
-    container_name: wbm-accounts-v2-backend
+      context: https://github.com/valianktni1/march-weddings-by-mark-accounts.git#main:backend
+    container_name: accounts-2026-backend
     restart: unless-stopped
     init: true
     environment:
       APP_ENV: production
-      APP_URL: http://YOUR-TRUENAS-IP:30050
-      ALLOWED_HOSTS: YOUR-TRUENAS-IP,localhost,127.0.0.1
-      CORS_ORIGINS: http://YOUR-TRUENAS-IP:30050
+      APP_URL: https://accounts2026.weddingsbymark.uk
+      ALLOWED_HOSTS: accounts2026.weddingsbymark.uk,192.168.24.10,localhost,127.0.0.1
+      CORS_ORIGINS: https://accounts2026.weddingsbymark.uk,http://192.168.24.10:30053
       SESSION_SECRET: CHANGE_TO_A_DIFFERENT_LONG_RANDOM_SESSION_SECRET
       SESSION_HOURS: "12"
       COOKIE_SECURE: "false"
       ADMIN_EMAIL: mark@perfectweddingsbymark.uk
       ADMIN_PASSWORD: CHANGE_TO_A_NEW_STRONG_ADMIN_PASSWORD
       MONGO_URL: mongodb://accountsadmin:CHANGE_TO_A_LONG_RANDOM_DATABASE_PASSWORD@mongodb:27017/?authSource=admin
-      DB_NAME: weddings_by_mark_accounts_v2
+      DB_NAME: weddings_by_mark_accounts_2026
+      STORAGE_ROOT: /app/storage
       MAX_RESTORE_MB: "250"
       GEMINI_API_KEY: ""
       BOOKING_INTEGRATION_ENABLED: "false"
       BOOKING_INTEGRATION_KEY: ""
     volumes:
-      - /mnt/temp-tntermediate/newaccounts-v2/data/uploads:/app/uploads
-      - /mnt/temp-tntermediate/newaccounts-v2/data/backups:/app/temp_backup
+      - /mnt/nextcloud/accounts-2026-saved-data:/app/storage
     depends_on:
       mongodb:
         condition: service_healthy
@@ -52,26 +52,26 @@ services:
     cap_drop:
       - ALL
     networks:
-      - wbm-accounts-v2-network
+      - accounts-2026-network
 
   frontend:
     build:
-      context: https://github.com/valianktni1/REPLACE-WITH-NEW-CLEAN-REPO.git#main:frontend
+      context: https://github.com/valianktni1/march-weddings-by-mark-accounts.git#main:frontend
       args:
         REACT_APP_BACKEND_URL: ""
-    container_name: wbm-accounts-v2-frontend
+    container_name: accounts-2026-frontend
     restart: unless-stopped
     init: true
     ports:
-      - 30050:80
+      - 30053:80
     depends_on:
       backend:
         condition: service_healthy
     security_opt:
       - no-new-privileges:true
     networks:
-      - wbm-accounts-v2-network
+      - accounts-2026-network
 
 networks:
-  wbm-accounts-v2-network:
-    name: wbm-accounts-v2-network
+  accounts-2026-network:
+    name: accounts-2026-network

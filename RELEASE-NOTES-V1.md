@@ -1,4 +1,4 @@
-# Secure Foundation V1
+# Secure Foundation V1.2 — Persistent storage correction
 
 ## Completed
 
@@ -13,6 +13,10 @@
 - Added a disabled-by-default, idempotent booking-invoice synchronisation endpoint.
 - Added a responsive login and navigation layout.
 - Added separate staging datasets and a migration guide that does not touch the live application.
+- Applied the agreed Accounts 2026 paths, port, local address, domain and existing repository.
+- Consolidated invoices, receipts, statements, exports, backups and restore workspaces beneath `/mnt/nextcloud/accounts-2026-saved-data`.
+- Added safe removal of associated PDFs, receipts and statements when their database records are deleted.
+- Added the missing application favicon.
 
 ## Verification
 

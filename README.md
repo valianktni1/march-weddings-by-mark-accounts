@@ -1,38 +1,40 @@
 # Weddings By Mark Accounts 2026
 
-Independent, self-hosted accounts manager for Weddings By Mark. This secure successor is based on the original application but has no Emergent runtime dependency.
+Independent, self-hosted accounts manager for Weddings By Mark. This is a secured successor to the existing application and has no Emergent runtime dependency.
 
 ## Included
 
 - Invoices and payment tracking
-- Expenses, receipt uploads and recurring expenses
+- Expenses, receipts and recurring expenses
 - Mileage calculations
-- Tide CSV and optional Gemini PDF/image bank-statement parsing
+- Tide CSV and optional direct Gemini bank-statement parsing
 - Bank transactions and UK tax-year summaries
-- Complete backup/restore, including mileage, settings, recurring expenses and uploaded files
-- Administrator login, signed secure sessions, CSRF protection and login throttling
-- Disabled-by-default API for synchronising invoices from the booking system
-- Mobile and desktop navigation
+- Complete backup and restore of all records and uploaded files
+- Administrator login, signed sessions, CSRF protection and login throttling
+- Disabled-by-default booking-system integration API
+- Responsive mobile and desktop navigation
+
+## Agreed TrueNAS layout
+
+- Local address: `http://192.168.24.10:30053`
+- Domain: `https://accounts2026.weddingsbymark.uk`
+- MongoDB data: `/mnt/apps/accounts-2026-use/mongodb`
+- Invoices, receipts, statements and backups: `/mnt/nextcloud/accounts-2026-saved-data`
+- Source repository: `https://github.com/valianktni1/march-weddings-by-mark-accounts`
+
+Use `docker-compose-truenas.yml` as the complete Dockge YAML. Change every `CHANGE_TO_...` value before deployment. Do not change the repeated database password in only one place: the MongoDB password and the password inside `MONGO_URL` must match exactly.
+
+Both the local address and HTTPS domain are allowed. `COOKIE_SECURE` is therefore set to `"false"`; otherwise an ordinary HTTP browser at the local IP cannot keep the login cookie. The cookie remains HttpOnly and SameSite Strict. Once local access is also HTTPS, change it to `"true"`.
 
 ## Important safety rules
 
-- Never commit `.env` files, passwords, API keys, database dumps or account backups.
-- Deploy the replacement alongside the existing accounts app first.
-- Keep `BOOKING_INTEGRATION_ENABLED=false` until both systems have been tested.
-- Do not switch `accounts.weddingsbymark.co.uk` until record counts and totals match.
+- Keep the old accounts application running while this replacement is tested.
+- Keep `BOOKING_INTEGRATION_ENABLED: "false"` until the accounts migration is verified.
+- Never commit `.env` files, passwords, API keys, database archives, invoices, receipts or account backups.
+- Read `SECURITY-NOTICE.md` before updating the existing GitHub repository.
 
-## Deployment
+The exact staging, backup, migration and verification sequence is in `TRUENAS-STAGING-AND-MIGRATION.md`.
 
-Use `docker-compose-truenas.yml` as the Dockge template. Replace every `CHANGE_TO_...`, `YOUR-TRUENAS-IP` and `REPLACE-WITH-NEW-CLEAN-REPO` value before deployment.
+## Booking integration
 
-The staging defaults are deliberately separate from the live Emergent installation:
-
-- Port: `30050`
-- MongoDB: `/mnt/apps/newaccounts-v2/mongodb`
-- Files/backups: `/mnt/temp-tntermediate/newaccounts-v2/data`
-
-See `TRUENAS-STAGING-AND-MIGRATION.md` for the exact safe deployment and migration sequence.
-
-## Integration contract
-
-See `docs/BOOKING-INTEGRATION.md`. The endpoint is authenticated with its own long random key, is idempotent, never sends client email and never modifies the booking-system database.
+The future integration contract is documented in `docs/BOOKING-INTEGRATION.md`. It is authenticated, idempotent and deliberately switched off. No booking records or client emails are affected by deploying this package.

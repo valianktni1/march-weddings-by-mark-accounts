@@ -27,12 +27,12 @@ services:
       ADMIN_PASSWORD: local-development-password
       MONGO_URL: mongodb://accountsadmin:local-development-password@mongodb:27017/?authSource=admin
       DB_NAME: weddings_by_mark_accounts_dev
+      STORAGE_ROOT: /app/storage
       GEMINI_API_KEY: ""
       BOOKING_INTEGRATION_ENABLED: "false"
       BOOKING_INTEGRATION_KEY: ""
     volumes:
-      - uploads_data:/app/uploads
-      - backups_data:/app/temp_backup
+      - storage_data:/app/storage
     depends_on:
       mongodb:
         condition: service_healthy
@@ -50,5 +50,4 @@ services:
 
 volumes:
   mongodb_data:
-  uploads_data:
-  backups_data:
+  storage_data:

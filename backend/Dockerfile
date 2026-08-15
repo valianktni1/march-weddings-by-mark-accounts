@@ -9,10 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY . .
 
-# Create upload directories
-RUN mkdir -p uploads/invoices uploads/expenses uploads/bank_statements temp_backup temp_restore
-
 RUN useradd --system --uid 10001 --create-home appuser \
+    && mkdir -p /app/storage/uploads/invoices /app/storage/uploads/expenses /app/storage/uploads/bank_statements /app/storage/backups /app/storage/temp_restore \
     && chown -R appuser:appuser /app
 
 USER appuser
