@@ -157,6 +157,7 @@ def test_booking_invoice_sync_is_idempotent_and_preserves_payments():
                 payload = server.BookingInvoiceSync(
                     event_id="event-invoice-123-revision-2",
                     source_invoice_id="invoice-123",
+                    source_booking_id="booking-123",
                     invoice_number="WBM02059",
                     couple_names="Example Couple",
                     wedding_date="2027-08-21",
@@ -174,11 +175,38 @@ def test_booking_invoice_sync_is_idempotent_and_preserves_payments():
                 assert first["invoice"]["balance_remaining"] == 850
                 assert len(first["invoice"]["payments"]) == 2
                 assert first["invoice"]["include_in_totals"] is False
+                assert first["invoice"]["gross_received"] == 150
+                assert first["invoice"]["total_refunded"] == 0
 
                 second = await server.sync_booking_invoice(payload)
                 assert second["status"] == "already_processed"
                 assert len(fake_db.invoices.rows) == 1
                 assert len(fake_db.integration_events.rows) == 1
+
+                cancelled = server.BookingInvoiceSync(
+                    event_id="event-invoice-123-cancelled-refunded",
+                    source_invoice_id="invoice-123",
+                    source_booking_id="booking-123",
+                    invoice_number="WBM02059",
+                    couple_names="Example Couple",
+                    wedding_date="2027-08-21",
+                    total_price=1000,
+                    due_date="2027-07-07",
+                    status="cancelled",
+                    cancellation_date="2026-08-17",
+                    cancellation_reason="Wedding cancelled and deposit returned",
+                    payments=[
+                        {"id": "payment-1", "amount": 100, "paid_date": "2026-08-14"},
+                        {"id": "refund-1", "amount": -100, "paid_date": "2026-08-17", "payment_type": "refund"},
+                    ],
+                )
+                cancelled_result = await server.sync_booking_invoice(cancelled)
+                assert cancelled_result["invoice"]["status"] == "cancelled"
+                assert cancelled_result["invoice"]["gross_received"] == 100
+                assert cancelled_result["invoice"]["total_refunded"] == 100
+                assert cancelled_result["invoice"]["amount_retained"] == 0
+                assert cancelled_result["invoice"]["balance_remaining"] == 0
+                assert len(fake_db.invoices.rows) == 1
         finally:
             server.db = original_db
             server.UPLOAD_DIR = original_upload

@@ -304,7 +304,9 @@ export const Invoices = () => {
 
   const handleViewPDF = (id) => { window.open(`${API}/invoices/${id}/pdf`, "_blank"); };
 
-  const getBalance = (inv) => (inv.total_price || inv.amount || 0) - (inv.deposit_amount || 0) - (inv.interim_payment || 0);
+  const getBalance = (inv) => inv.balance_remaining !== undefined
+    ? Number(inv.balance_remaining || 0)
+    : (inv.total_price || inv.amount || 0) - (inv.deposit_amount || 0) - (inv.interim_payment || 0);
   const getName = (inv) => inv.couple_names || inv.client_name || "-";
   const getTotal = (inv) => inv.total_price || inv.amount || 0;
   const getDate = (inv) => inv.wedding_date || inv.date || "-";
@@ -378,7 +380,7 @@ export const Invoices = () => {
               ) : (
                 filteredInvoices.map((inv) => (
                   <TableRow key={inv.id} className="border-stone-100" data-testid={`invoice-row-${inv.id}`}>
-                    <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}</TableCell>
+                    <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}{inv.source_system === "booking_system" && <span className="block mt-1 text-[10px] font-sans text-teal-700">BOOKING LINKED</span>}</TableCell>
                     <TableCell className="font-medium">{getName(inv)}</TableCell>
                     <TableCell className="font-mono text-sm">{getDate(inv)}</TableCell>
                     <TableCell className="text-stone-500 text-sm max-w-[180px] truncate">{inv.package_name || (inv.notes ? inv.notes.substring(0, 30) : "-")}</TableCell>
@@ -391,20 +393,21 @@ export const Invoices = () => {
                         {getStatus(inv)}
                       </span>
                       {inv.include_in_totals && <span className="text-xs px-2 py-1 rounded-sm bg-sky-50 text-sky-700 ml-1">Income</span>}
+                      {(inv.total_refunded || 0) > 0 && <span className="text-xs px-2 py-1 rounded-sm bg-rose-50 text-rose-700 ml-1">Refunded {formatCurrency(inv.total_refunded)}</span>}
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => openEdit(inv)} title="Edit" data-testid={`edit-invoice-${inv.id}`}>
+                        {inv.source_system !== "booking_system" && <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => openEdit(inv)} title="Edit" data-testid={`edit-invoice-${inv.id}`}>
                           <Pencil className="w-4 h-4 text-[#C7A76D]" />
-                        </Button>
+                        </Button>}
                         {inv.file_path && (
                           <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => handleViewPDF(inv.id)} title="View PDF" data-testid={`view-pdf-${inv.id}`}>
                             <Eye className="w-4 h-4 text-stone-400" />
                           </Button>
                         )}
-                        <Button variant="ghost" size="sm" className="h-8 w-8 p-0 hover:text-rose-600" onClick={() => handleDelete(inv.id)} title="Delete" data-testid={`delete-invoice-${inv.id}`}>
+                        {inv.source_system !== "booking_system" && <Button variant="ghost" size="sm" className="h-8 w-8 p-0 hover:text-rose-600" onClick={() => handleDelete(inv.id)} title="Delete" data-testid={`delete-invoice-${inv.id}`}>
                           <Trash2 className="w-4 h-4" />
-                        </Button>
+                        </Button>}
                       </div>
                     </TableCell>
                   </TableRow>

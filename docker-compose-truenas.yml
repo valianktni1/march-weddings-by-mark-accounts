@@ -41,7 +41,7 @@ services:
       MAX_RESTORE_MB: "250"
       GEMINI_API_KEY: ""
       BOOKING_INTEGRATION_ENABLED: "false"
-      BOOKING_INTEGRATION_KEY: ""
+      BOOKING_INTEGRATION_KEY: "REPLACE_WITH_THE_SAME_64_CHARACTER_SECRET_USED_BY_BOOKING"
     volumes:
       - /mnt/nextcloud/accounts-2026-saved-data:/app/storage
     depends_on:

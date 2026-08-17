@@ -1,4 +1,4 @@
-# Booking-system integration (disabled by default)
+# Booking-system integration V1.3 (disabled by default)
 
 ## Purpose
 
@@ -12,16 +12,27 @@ The integration:
 - does not modify booking-system records;
 - does not add mirrored invoices to income totals by default, preventing duplicated bank income;
 - processes each `event_id` once.
+- accepts Weddings By Mark wedding jobs only;
+- excludes enquiries, test records and Ivory Digital work;
+- accepts wedding jobs from 6 April 2025 onwards, with a payment-date
+  exception so relevant cash received in that period is not omitted;
+- retains signed refund entries and closes cancelled balances at zero;
+- prevents linked records being edited, deleted or renumbered in Accounts.
 
 ## Endpoint
 
-`POST /api/integrations/booking/invoices/sync`
+`POST /api/integrations/booking/invoices/batch`
 
 Required header:
 
 `X-Accounts-Integration-Key: <long random shared secret>`
 
-Example body:
+The booking system creates the versioned request automatically. Do not build or
+paste invoice JSON manually.
+
+Single-invoice compatibility remains available at:
+
+`POST /api/integrations/booking/invoices/sync`
 
 ```json
 {
@@ -58,4 +69,6 @@ BOOKING_INTEGRATION_ENABLED: "true"
 BOOKING_INTEGRATION_KEY: "the-new-shared-secret"
 ```
 
-Do not enable this until the accounts migration has been verified and the booking-system sender has passed its tests.
+Deploy Accounts first, then Booking. Leave Booking automatic sync off for the
+first connection check and confirmed initial sync. Once the waiting count is
+zero and the linked records have been checked, automatic sync can be enabled.

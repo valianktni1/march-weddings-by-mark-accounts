@@ -44,7 +44,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.15-persistent-storage-v1.2"
+BUILD_ID = "2026.08.17-booking-integration-v1.3"
 
 # Create the main app. Documentation is disabled in production so financial
 # API routes are not advertised publicly.
@@ -246,6 +246,8 @@ class BookingPaymentSync(BaseModel):
     amount: float
     paid_date: str
     payment_type: Optional[str] = None
+    reference: Optional[str] = Field(default=None, max_length=200)
+    notes: Optional[str] = Field(default=None, max_length=2000)
 
 
 class BookingInvoiceSync(BaseModel):
@@ -253,7 +255,13 @@ class BookingInvoiceSync(BaseModel):
 
     event_id: str = Field(min_length=8, max_length=160)
     source_invoice_id: str = Field(min_length=1, max_length=160)
+    source_booking_id: str = Field(min_length=1, max_length=160)
     invoice_number: str = Field(min_length=1, max_length=40)
+    brand: str = Field(default="wbm", max_length=20)
+    record_kind: str = Field(default="wedding", max_length=40)
+    is_test: bool = False
+    is_legacy_import: bool = False
+    scope_reason: str = Field(default="wedding_date", max_length=80)
     couple_names: str = Field(default="", max_length=300)
     client_address: Optional[str] = Field(default=None, max_length=1000)
     client_email: Optional[str] = Field(default=None, max_length=320)
@@ -262,12 +270,19 @@ class BookingInvoiceSync(BaseModel):
     venue: Optional[str] = Field(default=None, max_length=500)
     package_name: Optional[str] = Field(default=None, max_length=500)
     description: Optional[str] = Field(default=None, max_length=10000)
+    line_items: List[Dict[str, Any]] = Field(default_factory=list)
     total_price: float = 0
     due_date: Optional[str] = None
     status: str = Field(default="Pending", max_length=80)
     payments: List[BookingPaymentSync] = Field(default_factory=list)
     void_reason: Optional[str] = Field(default=None, max_length=2000)
+    cancellation_date: Optional[str] = None
+    cancellation_reason: Optional[str] = Field(default=None, max_length=2000)
     updated_at: Optional[str] = None
+
+
+class BookingInvoiceBatchSync(BaseModel):
+    invoices: List[BookingInvoiceSync] = Field(min_length=1, max_length=500)
 
 
 # Helper functions
@@ -976,8 +991,9 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
     except:
         pass
 
+    closed_label = "CANCELLED INVOICE" if invoice_data.get("status") == "cancelled" else "VOID INVOICE" if invoice_data.get("status") == "void" else "INVOICE"
     info_data = [
-        [Paragraph(f"<b>Invoice:</b> {inv_num}", normal_style), Paragraph(f"<b>Issue Date:</b> {issue_date}", right_style)],
+        [Paragraph(f"<b>{closed_label}:</b> {inv_num}", normal_style), Paragraph(f"<b>Issue Date:</b> {issue_date}", right_style)],
     ]
     info_table = Table(info_data, colWidths=[270, 270])
     info_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
@@ -1045,7 +1061,8 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
     elements.append(Paragraph("Payment Schedule", heading_style))
     deposit = invoice_data.get("deposit_amount", 0)
     interim = invoice_data.get("interim_payment", 0)
-    balance = total - deposit - interim
+    linked = invoice_data.get("source_system") == "booking_system"
+    balance = invoice_data.get("balance_remaining", total - deposit - interim) if linked else total - deposit - interim
     dep_date = invoice_data.get("deposit_paid_date") or "-"
     int_date = invoice_data.get("interim_payment_date") or "-"
     final_due = invoice_data.get("final_payment_due") or "-"
@@ -1058,11 +1075,22 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
     pay_data = [
         [Paragraph("<b>Payment</b>", small_style), Paragraph("<b>Amount</b>", ParagraphStyle("r", parent=small_style, alignment=TA_RIGHT)),
          Paragraph("<b>Status</b>", ParagraphStyle("c", parent=small_style, alignment=TA_CENTER)), Paragraph("<b>Date</b>", ParagraphStyle("c", parent=small_style, alignment=TA_CENTER))],
-        [Paragraph("Deposit", normal_style), Paragraph(f"£{deposit:,.2f}", right_style), Paragraph(dep_status, center_style), Paragraph(dep_date, center_style)],
     ]
-    if interim > 0:
-        pay_data.append([Paragraph("Interim Payment", normal_style), Paragraph(f"£{interim:,.2f}", right_style), Paragraph(int_status, center_style), Paragraph(int_date, center_style)])
-    pay_data.append([Paragraph("Remaining Balance", normal_style), Paragraph(f"£{balance:,.2f}", right_style), Paragraph(bal_status, center_style), Paragraph(f"Due: {final_due}" if bal_status == "Unpaid" else final_paid, center_style)])
+    if linked:
+        gross = invoice_data.get("gross_received", 0) or 0
+        refunded = invoice_data.get("total_refunded", 0) or 0
+        retained = invoice_data.get("amount_retained", 0) or 0
+        pay_data.append([Paragraph("Payments received", normal_style), Paragraph(f"£{gross:,.2f}", right_style), Paragraph("Recorded", center_style), Paragraph("See booking system", center_style)])
+        if refunded > 0:
+            pay_data.append([Paragraph("Refunded", normal_style), Paragraph(f"-£{refunded:,.2f}", right_style), Paragraph("Refunded", center_style), Paragraph("See booking system", center_style)])
+        pay_data.append([Paragraph("Payment retained", normal_style), Paragraph(f"£{retained:,.2f}", right_style), Paragraph("Recorded", center_style), Paragraph("-", center_style)])
+        closed_status = invoice_data.get("status") in {"cancelled", "void"}
+        pay_data.append([Paragraph("Remaining Balance", normal_style), Paragraph(f"£{balance:,.2f}", right_style), Paragraph("Closed" if closed_status else ("Paid" if balance <= 0 else "Unpaid"), center_style), Paragraph("-" if closed_status or balance <= 0 else f"Due: {final_due}", center_style)])
+    else:
+        pay_data.append([Paragraph("Deposit", normal_style), Paragraph(f"£{deposit:,.2f}", right_style), Paragraph(dep_status, center_style), Paragraph(dep_date, center_style)])
+        if interim > 0:
+            pay_data.append([Paragraph("Interim Payment", normal_style), Paragraph(f"£{interim:,.2f}", right_style), Paragraph(int_status, center_style), Paragraph(int_date, center_style)])
+        pay_data.append([Paragraph("Remaining Balance", normal_style), Paragraph(f"£{balance:,.2f}", right_style), Paragraph(bal_status, center_style), Paragraph(f"Due: {final_due}" if bal_status == "Unpaid" else final_paid, center_style)])
 
     pay_table = Table(pay_data, colWidths=[160, 110, 100, 170])
     pay_table.setStyle(TableStyle([
@@ -1075,6 +1103,12 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
     ]))
     elements.append(pay_table)
+
+    if linked and invoice_data.get("status") == "cancelled":
+        cancellation_text = invoice_data.get("cancellation_reason") or "Booking cancelled"
+        cancellation_date = invoice_data.get("cancellation_date") or "Not recorded"
+        elements.append(Spacer(1, 4*mm))
+        elements.append(Paragraph(f"<b>Cancellation recorded {cancellation_date}.</b> {cancellation_text}<br/>No further payment is due.", small_style))
 
     # Balance due
     if balance > 0 and bal_status == "Unpaid":
@@ -1201,6 +1235,8 @@ async def update_invoice(invoice_id: str, body: dict):
     existing = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if existing.get("source_system") == "booking_system":
+        raise HTTPException(status_code=409, detail="Linked invoices are edited in the booking system")
 
     # Merge updates
     for key in ["couple_names", "client_address", "client_email", "client_phone",
@@ -1293,6 +1329,8 @@ async def delete_invoice(invoice_id: str):
     invoice = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if invoice.get("source_system") == "booking_system":
+        raise HTTPException(status_code=409, detail="Linked invoices are retained and controlled by the booking system")
     result = await db.invoices.delete_one({"id": invoice_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -1304,7 +1342,9 @@ async def delete_invoice(invoice_id: str):
 async def migrate_invoice_numbers():
     """One-time migration: re-number all invoices chronologically by deposit date, starting from WBM01101"""
     import random
-    invoices = await db.invoices.find({}, {"_id": 0}).to_list(10000)
+    invoices = await db.invoices.find(
+        {"source_system": {"$ne": "booking_system"}}, {"_id": 0}
+    ).to_list(10000)
     
     # Sort by deposit_paid_date (earliest first), fallback to created_at
     def sort_key(inv):
@@ -1392,6 +1432,11 @@ async def migrate_invoice_numbers():
 
 @api_router.put("/invoices/{invoice_id}/status")
 async def update_invoice_status(invoice_id: str, body: dict):
+    existing = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if existing.get("source_system") == "booking_system":
+        raise HTTPException(status_code=409, detail="Linked invoice status is controlled by the booking system")
     status = body.get("status", "pending")
     result = await db.invoices.update_one(
         {"id": invoice_id},
@@ -1403,6 +1448,11 @@ async def update_invoice_status(invoice_id: str, body: dict):
 
 @api_router.put("/invoices/{invoice_id}/paid")
 async def update_invoice_paid(invoice_id: str, body: dict):
+    existing = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if existing.get("source_system") == "booking_system":
+        raise HTTPException(status_code=409, detail="Linked invoice payments are controlled by the booking system")
     paid = body.get("paid", 0)
     result = await db.invoices.update_one(
         {"id": invoice_id},
@@ -1416,11 +1466,10 @@ async def update_invoice_paid(invoice_id: str, body: dict):
 
 @api_router.get("/integrations/booking/health")
 async def booking_integration_health():
-    return {"status": "ready", "enabled": True, "version": 1}
+    return {"status": "ready", "enabled": True, "version": 2, "build": BUILD_ID}
 
 
-@api_router.post("/integrations/booking/invoices/sync")
-async def sync_booking_invoice(payload: BookingInvoiceSync):
+async def _sync_booking_invoice(payload: BookingInvoiceSync):
     """Idempotently mirror one booking-system invoice into accounts.
 
     This route never sends email, creates a client portal or changes the
@@ -1428,23 +1477,46 @@ async def sync_booking_invoice(payload: BookingInvoiceSync):
     from income totals by default to avoid double-counting bank credits.
     """
 
+    if payload.brand != "wbm" or payload.record_kind != "wedding" or payload.is_test:
+        raise HTTPException(status_code=422, detail="Only genuine Weddings By Mark wedding jobs can be mirrored")
+
+    cutoff = datetime(2025, 4, 6).date()
+    wedding_iso = payload.wedding_date[:10] if payload.wedding_date else None
+    try:
+        wedding_in_scope = bool(wedding_iso and datetime.fromisoformat(wedding_iso).date() >= cutoff)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid wedding date") from exc
+    payment_in_scope = False
+    for payment in payload.payments:
+        try:
+            payment_in_scope = payment_in_scope or datetime.fromisoformat(payment.paid_date[:10]).date() >= cutoff
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid payment date") from exc
+    if not wedding_in_scope and not payment_in_scope:
+        raise HTTPException(status_code=422, detail="Wedding is outside the agreed 2025/26 accounting scope")
+
     processed = await db.integration_events.find_one({"event_id": payload.event_id}, {"_id": 0})
     if processed:
         current = await db.invoices.find_one(
             {"source_system": "booking_system", "source_invoice_id": payload.source_invoice_id},
             {"_id": 0},
         )
-        return {"status": "already_processed", "invoice": current}
+        return {"status": "already_processed", "source_invoice_id": payload.source_invoice_id, "invoice": current}
 
     payments = [item.model_dump() for item in payload.payments]
     payments.sort(key=lambda item: (item.get("paid_date") or "", item.get("id") or ""))
-    total_paid = round(sum(max(0, float(item.get("amount", 0))) for item in payments), 2)
+    received_payments = [item for item in payments if float(item.get("amount", 0)) > 0]
+    refund_payments = [item for item in payments if float(item.get("amount", 0)) < 0]
+    gross_received = round(sum(float(item.get("amount", 0)) for item in received_payments), 2)
+    total_refunded = round(sum(-float(item.get("amount", 0)) for item in refund_payments), 2)
+    net_received = round(max(0, gross_received - total_refunded), 2)
     total_price = round(max(0, payload.total_price), 2)
-    balance = round(max(0, total_price - total_paid), 2)
-    first_payment = payments[0] if payments else None
-    remaining_payments = payments[1:] if len(payments) > 1 else []
+    closed = payload.status.lower() in {"cancelled", "void"}
+    balance = 0 if closed else round(max(0, total_price - net_received), 2)
+    first_payment = received_payments[0] if received_payments else None
+    remaining_payments = received_payments[1:] if len(received_payments) > 1 else []
     interim_total = round(sum(float(item.get("amount", 0)) for item in remaining_payments), 2)
-    paid_in_full = balance <= 0.009 and total_price > 0
+    paid_in_full = not closed and balance <= 0.009 and total_price > 0
     wedding_date = format_date_uk(payload.wedding_date) if payload.wedding_date else None
     due_date = format_date_uk(payload.due_date) if payload.due_date else (
         calc_final_payment_due(wedding_date) if wedding_date else None
@@ -1459,6 +1531,7 @@ async def sync_booking_invoice(payload: BookingInvoiceSync):
     invoice_data = {
         "id": invoice_id,
         "invoice_number": payload.invoice_number,
+        "source_booking_id": payload.source_booking_id,
         "couple_names": payload.couple_names,
         "client_address": payload.client_address,
         "client_email": payload.client_email,
@@ -1467,6 +1540,7 @@ async def sync_booking_invoice(payload: BookingInvoiceSync):
         "venue": payload.venue,
         "package_name": payload.package_name,
         "notes": payload.description,
+        "line_items": payload.line_items,
         "total_price": total_price,
         "deposit_amount": round(float(first_payment.get("amount", 0)), 2) if first_payment else 0,
         "deposit_paid_date": format_date_uk(first_payment.get("paid_date")) if first_payment else None,
@@ -1475,17 +1549,24 @@ async def sync_booking_invoice(payload: BookingInvoiceSync):
         "interim_payment_date": format_date_uk(remaining_payments[-1].get("paid_date")) if remaining_payments else None,
         "interim_tax_year": calc_tax_year_from_date(format_date_uk(remaining_payments[-1].get("paid_date"))) if remaining_payments else None,
         "final_payment_due": due_date,
-        "final_payment_paid_date": format_date_uk(payments[-1].get("paid_date")) if paid_in_full and payments else None,
-        "final_tax_year": calc_tax_year_from_date(format_date_uk(payments[-1].get("paid_date"))) if paid_in_full and payments else (calc_tax_year_from_date(due_date) if due_date else None),
+        "final_payment_paid_date": format_date_uk(received_payments[-1].get("paid_date")) if paid_in_full and received_payments else None,
+        "final_tax_year": calc_tax_year_from_date(format_date_uk(received_payments[-1].get("paid_date"))) if paid_in_full and received_payments else (calc_tax_year_from_date(due_date) if due_date else None),
         "balance_remaining": balance,
-        "amount_paid": total_paid,
+        "amount_paid": net_received,
+        "gross_received": gross_received,
+        "total_refunded": total_refunded,
+        "amount_retained": net_received,
         "payments": payments,
         "status": payload.status,
         "void_reason": payload.void_reason,
+        "cancellation_date": format_date_uk(payload.cancellation_date) if payload.cancellation_date else None,
+        "cancellation_reason": payload.cancellation_reason,
         "tax_year": calc_tax_year_from_date(format_date_uk(first_payment.get("paid_date"))) if first_payment else (calc_tax_year_from_date(wedding_date) if wedding_date else ""),
         "include_in_totals": False,
         "source_system": "booking_system",
         "source_invoice_id": payload.source_invoice_id,
+        "source_scope_reason": payload.scope_reason,
+        "source_is_legacy_import": payload.is_legacy_import,
         "source_updated_at": payload.updated_at,
         "updated_at": now_iso,
         "created_at": existing.get("created_at", now_iso) if existing else now_iso,
@@ -1511,7 +1592,21 @@ async def sync_booking_invoice(payload: BookingInvoiceSync):
         "processed_at": now_iso,
     })
     invoice_data.pop("_id", None)
-    return {"status": "synchronised", "invoice": invoice_data}
+    return {"status": "synchronised", "source_invoice_id": payload.source_invoice_id, "invoice": invoice_data}
+
+
+@api_router.post("/integrations/booking/invoices/sync")
+async def sync_booking_invoice(payload: BookingInvoiceSync):
+    return await _sync_booking_invoice(payload)
+
+
+@api_router.post("/integrations/booking/invoices/batch")
+async def sync_booking_invoice_batch(payload: BookingInvoiceBatchSync):
+    """Mirror a controlled batch while preserving idempotency per invoice revision."""
+    results = []
+    for invoice in payload.invoices:
+        results.append(await _sync_booking_invoice(invoice))
+    return {"status": "complete", "count": len(results), "results": results}
 
 
 # Expense endpoints
