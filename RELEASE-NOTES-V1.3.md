@@ -10,4 +10,10 @@
   not counted twice; cash reporting continues to use real bank transaction dates.
 - No email, reminder, portal or calendar action is performed.
 
-Build: `2026.08.17-booking-integration-v1.3`
+## V1.3.1 dashboard status hotfix
+
+- Paid, cancelled, void and refunded booking invoices are no longer shown as overdue.
+- Overdue alerts now use the authoritative balance transferred by the booking system.
+- Existing linked records are corrected immediately after deployment; no re-import or database edit is required.
+
+Build: `2026.08.17-booking-status-hotfix-v1.3.1`

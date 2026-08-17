@@ -1,0 +1,28 @@
+ACCOUNTS 2026 V1.3.1 - OVERDUE STATUS HOTFIX
+================================================
+
+This update fixes the dashboard displaying paid, cancelled, void or refunded
+booking invoices as overdue. It does not change or delete any invoice data.
+The existing 201 linked invoices do not need to be imported again.
+
+After publishing this complete ZIP to the main branch of:
+https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+Run in TrueNAS Shell:
+
+docker compose -f /mnt/apps/dockge/data/accounts-2026-use/compose.yaml build --no-cache backend
+
+docker compose -f /mnt/apps/dockge/data/accounts-2026-use/compose.yaml up -d --force-recreate backend
+
+Wait approximately 15 seconds, then run:
+
+curl -fsS http://127.0.0.1:30053/api/health
+
+Expected build:
+2026.08.17-booking-status-hotfix-v1.3.1
+
+Refresh the Accounts dashboard. Only invoices with a genuine positive balance
+and a due date in the past will appear under Overdue Payments.
+
+Keep automatic booking synchronisation switched off until the corrected
+dashboard has been checked.

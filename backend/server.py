@@ -44,7 +44,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.17-booking-integration-v1.3"
+BUILD_ID = "2026.08.17-booking-status-hotfix-v1.3.1"
 
 # Create the main app. Documentation is disabled in production so financial
 # API routes are not advertised publicly.
@@ -325,6 +325,37 @@ def format_date_uk(date_str: str) -> str:
         return date_str
     except Exception:
         return date_str
+
+
+CLOSED_INVOICE_STATUSES = {
+    "paid",
+    "paid in full",
+    "cancelled",
+    "canceled",
+    "void",
+    "refunded",
+}
+
+
+def _normalised_invoice_status(invoice: dict) -> str:
+    return str(invoice.get("status") or "").strip().lower().replace("_", " ")
+
+
+def _invoice_outstanding_balance(invoice: dict) -> float:
+    """Return the authoritative outstanding amount used by dashboard alerts.
+
+    Booking-linked invoices already contain a calculated balance that accounts
+    for every payment, refund, cancellation and write-off. Older manually
+    entered invoices retain the original fallback calculation.
+    """
+    if _normalised_invoice_status(invoice) in CLOSED_INVOICE_STATUSES:
+        return 0.0
+    if invoice.get("balance_remaining") is not None:
+        return round(max(0.0, float(invoice.get("balance_remaining") or 0)), 2)
+    total = float(invoice.get("total_price", 0) or invoice.get("amount", 0) or 0)
+    deposit = float(invoice.get("deposit_amount", 0) or 0)
+    interim = float(invoice.get("interim_payment", 0) or 0)
+    return round(max(0.0, total - deposit - interim), 2)
 
 
 def _client_ip(request: Request) -> str:
@@ -2322,7 +2353,8 @@ async def get_dashboard_extras(tax_year: str):
     today = datetime.now()
     overdue = []
     for inv in all_invoices:
-        if inv.get("status") == "Paid in Full":
+        balance = _invoice_outstanding_balance(inv)
+        if balance <= 0.009:
             continue
         due_date = parse_date(inv.get("final_payment_due", ""))
         if due_date and due_date < today:
@@ -2331,7 +2363,7 @@ async def get_dashboard_extras(tax_year: str):
                 "invoice_number": inv.get("invoice_number"),
                 "couple_names": inv.get("couple_names"),
                 "total_price": inv.get("total_price", 0),
-                "balance": round((inv.get("total_price", 0) or 0) - (inv.get("deposit_amount", 0) or 0) - (inv.get("interim_payment", 0) or 0), 2),
+                "balance": balance,
                 "due_date": inv.get("final_payment_due"),
                 "days_overdue": (today - due_date).days
             })

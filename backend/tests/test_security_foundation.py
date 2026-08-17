@@ -215,6 +215,28 @@ def test_booking_invoice_sync_is_idempotent_and_preserves_payments():
     asyncio.run(run())
 
 
+def test_dashboard_overdue_balance_honours_booking_status_and_balance():
+    assert server._invoice_outstanding_balance({
+        "status": "paid",
+        "total_price": 899,
+        "balance_remaining": 799,
+    }) == 0
+    assert server._invoice_outstanding_balance({
+        "status": "cancelled",
+        "total_price": 899,
+        "balance_remaining": 799,
+    }) == 0
+    assert server._invoice_outstanding_balance({
+        "status": "void",
+        "total_price": 899,
+    }) == 0
+    assert server._invoice_outstanding_balance({
+        "status": "part_paid",
+        "total_price": 899,
+        "balance_remaining": 499,
+    }) == 499
+
+
 def test_complete_backup_collection_list():
     assert set(server.BACKUP_COLLECTIONS) >= {
         "invoices",
