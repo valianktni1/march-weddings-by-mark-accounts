@@ -50,7 +50,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.18-combined-bank-matching-v1.4.3"
+BUILD_ID = "2026.08.18-old-accounts-migration-ready-v1.4.5"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -191,6 +191,13 @@ class ExpenseCreate(BaseModel):
     tax_year: str
     supplier: Optional[str] = None
     include_amount: bool = True
+
+
+class ExpenseUpdate(BaseModel):
+    description: str = Field(min_length=1, max_length=500)
+    category: str = Field(min_length=1, max_length=160)
+    supplier: Optional[str] = Field(default=None, max_length=200)
+    include_in_totals: Optional[bool] = None
 
 
 class Transaction(BaseModel):
@@ -335,6 +342,85 @@ class TransactionUpdate(BaseModel):
     transaction_type: str = Field(pattern="^(income|expense|owner_withdrawal|tax_payment)$")
     category: Optional[str] = Field(default=None, max_length=160)
     excluded_from_totals: bool = False
+
+
+def _expense_date_key(value: Optional[str]) -> datetime:
+    try:
+        return datetime.strptime(str(value or ""), "%d/%m/%Y")
+    except (TypeError, ValueError):
+        return datetime.min
+
+
+def build_expense_ledger_rows(
+    transactions: List[Dict[str, Any]],
+    expenses: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Combine bank and manual expenses without duplicating bank-linked receipts."""
+    linked_receipts = {
+        str(expense.get("source_transaction_id")): expense
+        for expense in expenses
+        if expense.get("source_transaction_id")
+    }
+    rows: List[Dict[str, Any]] = []
+
+    for transaction in transactions:
+        if transaction.get("transaction_type") != "expense":
+            continue
+        transaction_id = str(transaction.get("id") or "")
+        receipt = linked_receipts.get(transaction_id)
+        rows.append(
+            {
+                "id": transaction_id,
+                "record_id": transaction_id,
+                "source": "bank",
+                "source_label": "Bank statement",
+                "date": transaction.get("date") or "",
+                "description": transaction.get("description") or "",
+                "supplier": (receipt or {}).get("supplier") or "",
+                "category": transaction.get("category"),
+                "tax_year": transaction.get("tax_year") or "",
+                "amount": float(transaction.get("amount") or 0),
+                "included_in_totals": not bool(transaction.get("excluded_from_totals")),
+                "excluded_from_totals": bool(transaction.get("excluded_from_totals")),
+                "has_receipt": bool(receipt and receipt.get("file_path")),
+                "receipt_expense_id": (receipt or {}).get("id"),
+                "created_at": transaction.get("created_at"),
+            }
+        )
+
+    for expense in expenses:
+        # A bank-linked expense is supporting receipt metadata for the original
+        # bank transaction. It must never appear as a second expense row.
+        if expense.get("source_transaction_id") or expense.get("is_from_bank"):
+            continue
+        amount = float(expense.get("amount") or 0)
+        included_in_totals = expense.get("include_in_totals") is not False and amount != 0
+        expense_id = str(expense.get("id") or "")
+        rows.append(
+            {
+                "id": expense_id,
+                "record_id": expense_id,
+                "source": "manual",
+                "source_label": "Manual expense",
+                "date": expense.get("date") or "",
+                "description": expense.get("description") or "",
+                "supplier": expense.get("supplier") or "",
+                "category": expense.get("category"),
+                "tax_year": expense.get("tax_year") or "",
+                "amount": amount,
+                "included_in_totals": included_in_totals,
+                "excluded_from_totals": not included_in_totals,
+                "has_receipt": bool(expense.get("file_path")),
+                "receipt_expense_id": expense_id if expense.get("file_path") else None,
+                "created_at": expense.get("created_at"),
+            }
+        )
+
+    return sorted(
+        rows,
+        key=lambda row: (_expense_date_key(row.get("date")), row.get("created_at") or ""),
+        reverse=True,
+    )
 
 
 # Helper functions
@@ -2779,6 +2865,41 @@ async def get_expenses(tax_year: Optional[str] = None):
     return expenses
 
 
+@api_router.get("/expense-ledger")
+async def get_expense_ledger(tax_year: Optional[str] = None):
+    transaction_query: Dict[str, Any] = {"transaction_type": "expense"}
+    expense_query: Dict[str, Any] = {}
+    if tax_year:
+        transaction_query["tax_year"] = tax_year
+        expense_query["tax_year"] = tax_year
+    transactions = await db.transactions.find(transaction_query, {"_id": 0}).to_list(10000)
+    expenses = await db.expenses.find(expense_query, {"_id": 0}).to_list(10000)
+    return build_expense_ledger_rows(transactions, expenses)
+
+
+@api_router.put("/expenses/{expense_id}")
+async def update_expense(expense_id: str, payload: ExpenseUpdate):
+    expense = await db.expenses.find_one({"id": expense_id}, {"_id": 0})
+    if not expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
+    if expense.get("source_transaction_id") or expense.get("is_from_bank"):
+        raise HTTPException(
+            status_code=409,
+            detail="Edit the original bank transaction instead of its supporting receipt",
+        )
+    await _assert_tax_year_open(expense.get("tax_year"))
+    updates = {
+        "description": payload.description.strip(),
+        "category": payload.category.strip(),
+        "supplier": (payload.supplier or "").strip() or None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if payload.include_in_totals is not None:
+        updates["include_in_totals"] = payload.include_in_totals
+    await db.expenses.update_one({"id": expense_id}, {"$set": updates})
+    return await db.expenses.find_one({"id": expense_id}, {"_id": 0})
+
+
 @api_router.get("/expenses/{expense_id}/file")
 async def get_expense_file(expense_id: str):
     expense = await db.expenses.find_one({"id": expense_id}, {"_id": 0})
@@ -3561,6 +3682,7 @@ BACKUP_COLLECTIONS = [
     "cash_payment_audit",
     "booking_bank_matches",
     "booking_bank_match_audit",
+    "migration_audits",
 ]
 BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
 

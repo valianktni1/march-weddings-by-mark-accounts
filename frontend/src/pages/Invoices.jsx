@@ -16,7 +16,7 @@ import { formatCurrency } from "@/utils/formatters";
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 const TAX_YEARS = [
-  { id: "2023-24", label: "2023/24" }, { id: "2024-25", label: "2024/25" },
+  { id: "2022-23", label: "2022/23" }, { id: "2023-24", label: "2023/24" }, { id: "2024-25", label: "2024/25" },
   { id: "2025-26", label: "2025/26" }, { id: "2026-27", label: "2026/27" },
   { id: "2027-28", label: "2027/28" }, { id: "2028-29", label: "2028/29" },
   { id: "2029-30", label: "2029/30" },

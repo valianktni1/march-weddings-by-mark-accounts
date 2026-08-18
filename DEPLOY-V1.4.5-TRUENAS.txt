@@ -1,0 +1,66 @@
+WEDDINGS BY MARK ACCOUNTS V1.4.5 - TRUENAS DEPLOYMENT AND DRY RUN
+=================================================================
+
+This is a cumulative release containing every V1.4 through V1.4.4 change.
+Do not apply the old-data import yet. Complete only the dry run and review it.
+
+1. Upload this complete release to the root of:
+   https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+2. Rebuild Accounts:
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" down
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d
+
+3. Verify the release:
+
+docker compose -f "$ACCOUNTS_COMPOSE" ps
+curl -fsS http://127.0.0.1:30053/api/health
+echo
+
+Expected build:
+2026.08.18-old-accounts-migration-ready-v1.4.5
+
+4. Export the four approved old collections and stage their files:
+
+MIGRATION_ROOT=/mnt/nextcloud/accounts-2026-saved-data/migration-from-old-accounts
+SOURCE_DIR="$MIGRATION_ROOT/source"
+
+mkdir -p "$SOURCE_DIR/files/invoices"
+mkdir -p "$SOURCE_DIR/files/expenses"
+
+docker exec new-weddings-db mongoexport --quiet --db weddings_by_mark --collection invoices --jsonArray > "$SOURCE_DIR/invoices.json"
+docker exec new-weddings-db mongoexport --quiet --db weddings_by_mark --collection expenses --jsonArray > "$SOURCE_DIR/expenses.json"
+docker exec new-weddings-db mongoexport --quiet --db weddings_by_mark --collection mileage --jsonArray > "$SOURCE_DIR/mileage.json"
+docker exec new-weddings-db mongoexport --quiet --db weddings_by_mark --collection recurring_expenses --jsonArray > "$SOURCE_DIR/recurring_expenses.json"
+
+cp -a /mnt/nextcloud/newaccountsaveddata/invoices/. "$SOURCE_DIR/files/invoices/"
+cp -a /mnt/nextcloud/newaccountsaveddata/expenses/. "$SOURCE_DIR/files/expenses/"
+
+chown -R 10001:10001 "$MIGRATION_ROOT"
+
+5. Confirm the staged source sizes:
+
+ls -lh "$SOURCE_DIR"/*.json
+find "$SOURCE_DIR/files/invoices" -type f | wc -l
+find "$SOURCE_DIR/files/expenses" -type f | wc -l
+
+Expected file counts:
+154 invoice files
+61 expense files
+
+6. Run validation and dry-run planning only:
+
+docker compose -f "$ACCOUNTS_COMPOSE" run --rm backend \
+  python old_accounts_import.py
+
+The command must finish with:
+DRY RUN ONLY - the target database and files were not changed.
+
+Send the complete dry-run output for review. Do not run --apply yet.
+
+No YAML changes are required. The existing verified backups are required by
+the importer before a later apply operation is accepted.

@@ -1,0 +1,57 @@
+WEDDINGS BY MARK ACCOUNTS V1.4.4 - TRUENAS DEPLOYMENT
+======================================================
+
+This is a complete cumulative release. It includes V1.4, V1.4.1, V1.4.2,
+V1.4.3 and the new unified Expenses ledger.
+
+1. Upload this complete release to the root of:
+   https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+2. Take a safe MongoDB backup in the TrueNAS shell:
+
+ACCOUNTS_EXPENSE_LEDGER_BACKUP=/mnt/nextcloud/accounts-2026-saved-data/backups/accounts-before-unified-expense-ledger-v1.4.4-2026-08-18.archive.gz
+
+if [ -e "$ACCOUNTS_EXPENSE_LEDGER_BACKUP" ]; then
+  echo "STOP: Accounts backup already exists — nothing was overwritten"
+else
+  docker exec accounts-2026-db sh -lc 'mongodump --quiet --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --db weddings_by_mark_accounts_2026 --archive --gzip' > "$ACCOUNTS_EXPENSE_LEDGER_BACKUP"
+fi
+
+ls -lh "$ACCOUNTS_EXPENSE_LEDGER_BACKUP"
+gzip -t "$ACCOUNTS_EXPENSE_LEDGER_BACKUP" && echo "Accounts backup integrity OK"
+
+3. Rebuild Accounts:
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" down
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d
+
+4. Wait for startup and verify:
+
+docker compose -f "$ACCOUNTS_COMPOSE" ps
+
+for ATTEMPT in $(seq 1 30); do
+  ACCOUNTS_HEALTH=$(curl -sS http://127.0.0.1:30053/api/health 2>/dev/null || true)
+  if printf '%s' "$ACCOUNTS_HEALTH" | grep -q '"status":"ok"'; then
+    printf '%s\n' "$ACCOUNTS_HEALTH"
+    break
+  fi
+  printf 'Waiting for Accounts — attempt %s/30\n' "$ATTEMPT"
+  sleep 2
+done
+
+Expected build:
+2026.08.18-unified-expense-ledger-v1.4.4
+
+5. Open Accounts > Expenses and confirm:
+
+   - imported Tide spending is visible;
+   - rows say Bank statement or Manual expense;
+   - the pencil button opens the category editor;
+   - changing a bank category updates the same transaction;
+   - bank-linked receipts do not appear as duplicate expense rows.
+
+No YAML changes are required. Booking integration remains in its current
+disabled state and this release does not contact the Booking app.
