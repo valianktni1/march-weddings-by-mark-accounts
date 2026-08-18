@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Switch } from "@/components/ui/switch";
-import { Plus, Trash2, Eye, Pencil, Upload, Loader2 } from "lucide-react";
+import { Plus, Trash2, Eye, Pencil, Upload, Loader2, Ban, RotateCcw, ShieldAlert, History } from "lucide-react";
 import { formatCurrency } from "@/utils/formatters";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
@@ -80,7 +80,7 @@ const PdfScanUpload = ({ onScanned }) => {
   );
 };
 
-const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel }) => {
+const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel, linked = false }) => {
   const finalBalance = (parseFloat(formData.total_price) || 0) - (parseFloat(formData.deposit_amount) || 0) - (parseFloat(formData.interim_payment) || 0);
   return (
     <form onSubmit={onSubmit} className="space-y-3">
@@ -175,13 +175,19 @@ const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel }) => {
         <Label>Package Details / Notes</Label>
         <Textarea value={formData.notes} onChange={(e) => setFormData({ ...formData, notes: e.target.value })} placeholder="What's included..." rows={3} className="border-stone-200" data-testid="notes-input" />
       </div>
-      <div className="flex items-center justify-between py-2 px-3 bg-stone-50 rounded">
-        <div>
-          <Label className="text-sm font-medium text-stone-700">Add to Income</Label>
-          <p className="text-xs text-stone-400">Include this invoice amount in income totals (e.g. cash sale)</p>
+      {linked ? (
+        <div className="py-2 px-3 bg-teal-50 border border-teal-100 rounded text-xs text-teal-800">
+          Booking-linked invoices remain excluded from income totals so bank transactions are not counted twice.
         </div>
-        <Switch checked={formData.include_in_totals} onCheckedChange={(checked) => setFormData({ ...formData, include_in_totals: checked })} data-testid="include-in-totals-switch" />
-      </div>
+      ) : (
+        <div className="flex items-center justify-between py-2 px-3 bg-stone-50 rounded">
+          <div>
+            <Label className="text-sm font-medium text-stone-700">Add to Income</Label>
+            <p className="text-xs text-stone-400">Include this invoice amount in income totals (e.g. cash sale)</p>
+          </div>
+          <Switch checked={formData.include_in_totals} onCheckedChange={(checked) => setFormData({ ...formData, include_in_totals: checked })} data-testid="include-in-totals-switch" />
+        </div>
+      )}
 
       {/* Summary */}
       {formData.total_price && (
@@ -198,7 +204,7 @@ const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel }) => {
           </div>
         </div>
       )}
-      <p className="text-xs text-stone-400">Tax years auto-assigned per payment date. {formData.include_in_totals ? "This invoice WILL be counted in income totals." : "Not counted in income totals unless toggled above."}</p>
+      <p className="text-xs text-stone-400">Tax years auto-assigned per payment date. {linked ? "This linked invoice is not counted again in income totals." : formData.include_in_totals ? "This invoice WILL be counted in income totals." : "Not counted in income totals unless toggled above."}</p>
       <Button type="submit" disabled={!onSubmit} className="w-full bg-[#C7A76D] hover:bg-[#B8985E] text-white rounded-sm" data-testid="submit-invoice-btn">
         {submitLabel}
       </Button>
@@ -211,6 +217,13 @@ export const Invoices = () => {
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
   const [editInvoice, setEditInvoice] = useState(null);
+  const [emergencyReason, setEmergencyReason] = useState("");
+  const [safetyInvoice, setSafetyInvoice] = useState(null);
+  const [safetyAction, setSafetyAction] = useState(null);
+  const [safetyReason, setSafetyReason] = useState("");
+  const [auditInvoice, setAuditInvoice] = useState(null);
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [auditLoading, setAuditLoading] = useState(false);
   const [filterTaxYear, setFilterTaxYear] = useState("all");
   const [searchName, setSearchName] = useState("");
   const [sortAlpha, setSortAlpha] = useState(false);
@@ -232,6 +245,7 @@ export const Invoices = () => {
 
   const openEdit = (inv) => {
     setEditInvoice(inv);
+    setEmergencyReason("");
     setFormData({
       couple_names: inv.couple_names || inv.client_name || "",
       client_address: inv.client_address || "",
@@ -287,13 +301,65 @@ export const Invoices = () => {
     if (!editInvoice) return;
     setSubmitting(true);
     try {
-      await axios.put(`${API}/invoices/${editInvoice.id}`, buildPayload());
-      toast.success("Invoice updated & PDF regenerated");
+      const linked = editInvoice.source_system === "booking_system";
+      if (linked && emergencyReason.trim().length < 5) {
+        toast.error("Please enter a clear reason for the Accounts override");
+        setSubmitting(false);
+        return;
+      }
+      const endpoint = linked
+        ? `${API}/invoices/${editInvoice.id}/emergency-edit`
+        : `${API}/invoices/${editInvoice.id}`;
+      await axios.put(endpoint, linked ? { ...buildPayload(), reason: emergencyReason.trim() } : buildPayload());
+      toast.success(linked ? "Accounts copy updated and safely locked" : "Invoice updated & PDF regenerated");
       setEditInvoice(null);
+      setEmergencyReason("");
       setFormData(emptyForm);
       fetchInvoices();
-    } catch { toast.error("Failed to update invoice"); }
+    } catch (err) { toast.error(err?.response?.data?.detail || "Failed to update invoice"); }
     finally { setSubmitting(false); }
+  };
+
+  const openSafetyAction = (inv, action) => {
+    setSafetyInvoice(inv);
+    setSafetyAction(action);
+    setSafetyReason("");
+  };
+
+  const handleSafetyAction = async () => {
+    if (!safetyInvoice || !safetyAction) return;
+    if (safetyReason.trim().length < 5) {
+      toast.error("Please enter a clear reason (at least 5 characters)");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const route = safetyAction === "restore" ? "restore-booking" : "void";
+      await axios.post(`${API}/invoices/${safetyInvoice.id}/${route}`, { reason: safetyReason.trim() });
+      toast.success(safetyAction === "restore" ? "Latest Booking values restored" : "Invoice voided in Accounts");
+      setSafetyInvoice(null);
+      setSafetyAction(null);
+      setSafetyReason("");
+      fetchInvoices();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Invoice safeguard failed");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const openAuditHistory = async (inv) => {
+    setAuditInvoice(inv);
+    setAuditLogs([]);
+    setAuditLoading(true);
+    try {
+      const res = await axios.get(`${API}/invoices/${inv.id}/audit`);
+      setAuditLogs(res.data);
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Failed to load invoice history");
+    } finally {
+      setAuditLoading(false);
+    }
   };
 
   const handleDelete = async (id) => {
@@ -380,7 +446,7 @@ export const Invoices = () => {
               ) : (
                 filteredInvoices.map((inv) => (
                   <TableRow key={inv.id} className="border-stone-100" data-testid={`invoice-row-${inv.id}`}>
-                    <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}{inv.source_system === "booking_system" && <span className="block mt-1 text-[10px] font-sans text-teal-700">BOOKING LINKED</span>}</TableCell>
+                    <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}{inv.source_system === "booking_system" && <span className="block mt-1 text-[10px] font-sans text-teal-700">BOOKING LINKED</span>}{inv.legacy_invoice_number && inv.legacy_invoice_number !== inv.invoice_number && <span className="block mt-1 text-[10px] font-sans text-stone-500">Previous Studio Ninja: {inv.legacy_invoice_number}</span>}</TableCell>
                     <TableCell className="font-medium">{getName(inv)}</TableCell>
                     <TableCell className="font-mono text-sm">{getDate(inv)}</TableCell>
                     <TableCell className="text-stone-500 text-sm max-w-[180px] truncate">{inv.package_name || (inv.notes ? inv.notes.substring(0, 30) : "-")}</TableCell>
@@ -389,15 +455,21 @@ export const Invoices = () => {
                       {getBalance(inv) > 0 ? <span className="text-amber-600">{formatCurrency(getBalance(inv))}</span> : <span className="text-emerald-600">{formatCurrency(0)}</span>}
                     </TableCell>
                     <TableCell>
-                      <span className={`text-xs px-2 py-1 rounded-sm ${getStatus(inv) === "Paid in Full" ? "bg-emerald-50 text-emerald-700" : getStatus(inv) === "Deposit Paid" ? "bg-amber-50 text-amber-700" : getStatus(inv) === "Interim Paid" ? "bg-blue-50 text-blue-700" : "bg-stone-100 text-stone-600"}`}>
+                      <span className={`text-xs px-2 py-1 rounded-sm ${getStatus(inv) === "Paid in Full" ? "bg-emerald-50 text-emerald-700" : getStatus(inv) === "Deposit Paid" ? "bg-amber-50 text-amber-700" : getStatus(inv) === "Interim Paid" ? "bg-blue-50 text-blue-700" : ["void", "cancelled"].includes(String(getStatus(inv)).toLowerCase()) ? "bg-rose-50 text-rose-700" : "bg-stone-100 text-stone-600"}`}>
                         {getStatus(inv)}
                       </span>
                       {inv.include_in_totals && <span className="text-xs px-2 py-1 rounded-sm bg-sky-50 text-sky-700 ml-1">Income</span>}
                       {(inv.total_refunded || 0) > 0 && <span className="text-xs px-2 py-1 rounded-sm bg-rose-50 text-rose-700 ml-1">Refunded {formatCurrency(inv.total_refunded)}</span>}
+                      {inv.accounts_override?.active && (
+                        <span className="block mt-2 text-[10px] leading-tight text-amber-800" title={inv.accounts_override.reason || "Accounts override active"}>
+                          <span className="inline-block px-2 py-1 rounded-sm bg-amber-100 font-semibold">ACCOUNTS OVERRIDE</span>
+                          <span className="block mt-1 max-w-[190px] truncate">{inv.accounts_override.reason}</span>
+                        </span>
+                      )}
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex items-center justify-end gap-1">
-                        {inv.source_system !== "booking_system" && <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => openEdit(inv)} title="Edit" data-testid={`edit-invoice-${inv.id}`}>
+                        {String(getStatus(inv)).toLowerCase() !== "void" && <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => openEdit(inv)} title={inv.source_system === "booking_system" ? "Emergency edit Accounts copy" : "Edit"} data-testid={`edit-invoice-${inv.id}`}>
                           <Pencil className="w-4 h-4 text-[#C7A76D]" />
                         </Button>}
                         {inv.file_path && (
@@ -408,6 +480,21 @@ export const Invoices = () => {
                         {inv.source_system !== "booking_system" && <Button variant="ghost" size="sm" className="h-8 w-8 p-0 hover:text-rose-600" onClick={() => handleDelete(inv.id)} title="Delete" data-testid={`delete-invoice-${inv.id}`}>
                           <Trash2 className="w-4 h-4" />
                         </Button>}
+                        {!(["void", "cancelled"].includes(String(getStatus(inv)).toLowerCase())) && (
+                          <Button variant="ghost" size="sm" className="h-8 w-8 p-0 hover:text-rose-600" onClick={() => openSafetyAction(inv, "void")} title="Void in Accounts" data-testid={`void-invoice-${inv.id}`}>
+                            <Ban className="w-4 h-4" />
+                          </Button>
+                        )}
+                        {inv.source_system === "booking_system" && inv.accounts_override?.active && (
+                          <Button variant="ghost" size="sm" className="h-8 w-8 p-0 hover:text-teal-700" onClick={() => openSafetyAction(inv, "restore")} title="Restore latest Booking values" data-testid={`restore-invoice-${inv.id}`}>
+                            <RotateCcw className="w-4 h-4" />
+                          </Button>
+                        )}
+                        {inv.accounts_override && (
+                          <Button variant="ghost" size="sm" className="h-8 w-8 p-0 hover:text-amber-700" onClick={() => openAuditHistory(inv)} title="View safeguard history" data-testid={`invoice-audit-${inv.id}`}>
+                            <History className="w-4 h-4" />
+                          </Button>
+                        )}
                       </div>
                     </TableCell>
                   </TableRow>
@@ -419,7 +506,7 @@ export const Invoices = () => {
       </Card>
 
       {/* Edit Invoice Dialog */}
-      <Dialog open={!!editInvoice} onOpenChange={(open) => { if (!open) { setEditInvoice(null); setFormData(emptyForm); } }}>
+      <Dialog open={!!editInvoice} onOpenChange={(open) => { if (!open) { setEditInvoice(null); setEmergencyReason(""); setFormData(emptyForm); } }}>
         <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto" data-testid="edit-invoice-dialog">
           {editInvoice && (
             <>
@@ -436,7 +523,85 @@ export const Invoices = () => {
                 )}
                 <div className="flex justify-between"><span className="text-stone-500">Balance</span><span>{editInvoice.final_payment_paid_date ? `Paid ${editInvoice.final_payment_paid_date}` : editInvoice.final_payment_due ? `Due ${editInvoice.final_payment_due}` : "TBC"} {editInvoice.final_tax_year ? `· ${tyLabel(editInvoice.final_tax_year)}` : ""}</span></div>
               </div>
-              <InvoiceForm formData={formData} setFormData={setFormData} onSubmit={handleUpdate} submitLabel={submitting ? "Saving..." : "Save Changes & Regenerate PDF"} />
+              {editInvoice.source_system === "booking_system" && (
+                <div className="bg-amber-50 border border-amber-200 rounded-md p-3 space-y-3">
+                  <div className="flex gap-2 text-amber-900">
+                    <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" />
+                    <div>
+                      <p className="text-sm font-semibold">Emergency Accounts override</p>
+                      <p className="text-xs mt-1">This changes only the Accounts copy. Future Booking syncs will be safely held behind this override until you choose Restore Booking Values.</p>
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="emergency-edit-reason" className="text-xs">Reason for this change *</Label>
+                    <Textarea id="emergency-edit-reason" value={emergencyReason} onChange={(e) => setEmergencyReason(e.target.value)} rows={2} placeholder="For example: correcting an imported total after checking the original invoice" data-testid="emergency-edit-reason" />
+                  </div>
+                </div>
+              )}
+              <InvoiceForm formData={formData} setFormData={setFormData} onSubmit={handleUpdate} linked={editInvoice.source_system === "booking_system"} submitLabel={submitting ? "Saving..." : editInvoice.source_system === "booking_system" ? "Save Accounts Override & Regenerate PDF" : "Save Changes & Regenerate PDF"} />
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!safetyInvoice} onOpenChange={(open) => { if (!open) { setSafetyInvoice(null); setSafetyAction(null); setSafetyReason(""); } }}>
+        <DialogContent className="max-w-md" data-testid="invoice-safety-dialog">
+          {safetyInvoice && (
+            <>
+              <DialogHeader>
+                <DialogTitle style={{ fontFamily: 'Playfair Display, serif' }}>
+                  {safetyAction === "restore" ? "Restore Booking Values" : "Void Invoice in Accounts"}
+                </DialogTitle>
+              </DialogHeader>
+              <div className={`rounded-md border p-3 text-sm ${safetyAction === "restore" ? "bg-teal-50 border-teal-200 text-teal-900" : "bg-rose-50 border-rose-200 text-rose-900"}`}>
+                <p className="font-semibold">{safetyInvoice.invoice_number} — {getName(safetyInvoice)}</p>
+                <p className="text-xs mt-1">
+                  {safetyAction === "restore"
+                    ? "This replaces the Accounts override with the latest Booking values saved during synchronisation."
+                    : "This voids only the Accounts copy. It does not alter the Booking system and it sends no email to the couple."}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="invoice-safety-reason">Reason *</Label>
+                <Textarea id="invoice-safety-reason" value={safetyReason} onChange={(e) => setSafetyReason(e.target.value)} rows={4} placeholder={safetyAction === "restore" ? "Why are you restoring the Booking values?" : "Why is this invoice being voided?"} data-testid="invoice-safety-reason" />
+                <p className="text-xs text-stone-500">This reason is kept permanently in the invoice audit history.</p>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => { setSafetyInvoice(null); setSafetyAction(null); setSafetyReason(""); }}>Cancel</Button>
+                <Button disabled={submitting} onClick={handleSafetyAction} className={safetyAction === "restore" ? "bg-teal-700 hover:bg-teal-800 text-white" : "bg-rose-700 hover:bg-rose-800 text-white"} data-testid="confirm-invoice-safety-action">
+                  {submitting ? "Saving..." : safetyAction === "restore" ? "Restore Booking Values" : "Void in Accounts"}
+                </Button>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!auditInvoice} onOpenChange={(open) => { if (!open) { setAuditInvoice(null); setAuditLogs([]); } }}>
+        <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto" data-testid="invoice-audit-dialog">
+          {auditInvoice && (
+            <>
+              <DialogHeader>
+                <DialogTitle style={{ fontFamily: 'Playfair Display, serif' }}>Safeguard History — {auditInvoice.invoice_number}</DialogTitle>
+              </DialogHeader>
+              {auditLoading ? (
+                <p className="py-6 text-center text-stone-500">Loading history...</p>
+              ) : auditLogs.length === 0 ? (
+                <p className="py-6 text-center text-stone-500">No safeguard changes have been recorded.</p>
+              ) : (
+                <div className="space-y-3">
+                  {auditLogs.map((entry) => (
+                    <div key={entry.id} className="border border-stone-200 rounded-md p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-semibold uppercase tracking-wide text-amber-800">{String(entry.action || "change").replaceAll("_", " ")}</span>
+                        <span className="text-xs text-stone-500">{entry.created_at ? new Date(entry.created_at).toLocaleString("en-GB") : ""}</span>
+                      </div>
+                      <p className="text-sm text-stone-800 mt-2 whitespace-pre-wrap">{entry.reason}</p>
+                      <p className="text-xs text-stone-500 mt-2">Recorded by {entry.admin_email || "administrator"}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
             </>
           )}
         </DialogContent>

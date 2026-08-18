@@ -1,0 +1,37 @@
+ACCOUNTS 2026 V1.3.3 - AUDITED EMERGENCY INVOICE CONTROLS
+=========================================================
+
+This is a cumulative build. It includes V1.3.2 chronological invoice support
+and the V1.3.1 false-overdue fix.
+
+Use this complete ZIP instead of V1.3.2. No YAML changes are required.
+Keep ACCOUNTS_INTEGRATION_AUTO_SYNC: "false" in the Booking YAML until the
+controlled Booking migration has been completed and checked.
+
+After publishing this complete ZIP to the main branch of:
+https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+Run in TrueNAS Shell:
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d --force-recreate backend frontend
+
+Wait approximately 15 seconds, then run:
+
+curl -fsS http://127.0.0.1:30053/api/health
+
+Expected build:
+2026.08.17-emergency-invoice-controls-v1.3.3
+
+New invoice safeguards:
+- Accounts-created invoices retain their normal Edit control and can be voided.
+- Booking-linked invoices have an Emergency Edit Accounts Copy control.
+- Every emergency edit, void and restore requires a written reason.
+- The History button displays the permanent safeguard record.
+- A linked override is not silently overwritten by a later Booking sync.
+- Restore Booking Values reapplies the latest saved Booking data.
+- Linked invoices cannot be deleted and remain excluded from income totals.
+- These controls never email a couple and never alter the Booking system.
+

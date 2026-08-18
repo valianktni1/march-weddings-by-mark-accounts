@@ -17,7 +17,16 @@ The integration:
 - accepts wedding jobs from 6 April 2025 onwards, with a payment-date
   exception so relevant cash received in that period is not omitted;
 - retains signed refund entries and closes cancelled balances at zero;
-- prevents linked records being edited, deleted or renumbered in Accounts.
+- prevents linked records being deleted or silently renumbered in Accounts;
+- permits a clearly marked emergency edit or void of the Accounts copy only,
+  requiring a reason and retaining a permanent audit history;
+- holds an active Accounts override safely when later Booking updates arrive,
+  while saving those latest Booking values for an explicit restore;
+- updates an existing linked record in place when Booking deliberately changes its
+  displayed invoice number;
+- preserves Booking's original invoice issue date and private Studio Ninja reference;
+- replaces the generated PDF filename after a controlled renumber and removes the
+  obsolete managed PDF only after the new copy exists.
 
 ## Endpoint
 
@@ -38,7 +47,10 @@ Single-invoice compatibility remains available at:
 {
   "event_id": "invoice-updated:booking-invoice-id:revision-3",
   "source_invoice_id": "booking-invoice-id",
+  "source_booking_id": "booking-id",
   "invoice_number": "WBM02059",
+  "legacy_invoice_number": "WBM01647",
+  "issue_date": "2026-08-14",
   "couple_names": "Example Couple",
   "client_email": "couple@example.invalid",
   "wedding_date": "2027-08-21",

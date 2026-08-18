@@ -1,0 +1,36 @@
+ACCOUNTS 2026 V1.3.2 - CHRONOLOGICAL BOOKING INVOICE SUPPORT
+============================================================
+
+This is a cumulative build and includes the V1.3.1 false-overdue fix.
+
+It must be deployed BEFORE BookingSystem2026 V8.10.1 is renumbered.
+Keep ACCOUNTS_INTEGRATION_AUTO_SYNC: "false" in the Booking YAML.
+
+After publishing this complete ZIP to the main branch of:
+https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+Run in TrueNAS Shell:
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d --force-recreate backend frontend
+
+Wait approximately 15 seconds, then run:
+
+curl -fsS http://127.0.0.1:30053/api/health
+
+Expected build:
+2026.08.17-chronological-invoices-v1.3.2
+
+What this release does:
+- receives the booking invoice issue date instead of using the sync date;
+- retains the former Studio Ninja number as a private reference;
+- updates the existing Accounts invoice by permanent booking invoice ID;
+- does not create a duplicate when the visible WBM number changes;
+- regenerates the PDF under its new number and removes the obsolete managed PDF;
+- keeps paid, cancelled, void and refunded invoices out of overdue totals;
+- sends no emails and never changes Booking records.
+
+Do not press the manual sync button until the Booking V8.10.1 migration has been
+previewed, applied and checked.

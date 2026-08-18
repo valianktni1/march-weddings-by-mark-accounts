@@ -143,6 +143,7 @@ def test_booking_invoice_sync_is_idempotent_and_preserves_payments():
         def __init__(self):
             self.invoices = Collection()
             self.integration_events = Collection()
+            self.invoice_audit_logs = Collection()
 
     async def run():
         original_db = server.db
@@ -159,6 +160,8 @@ def test_booking_invoice_sync_is_idempotent_and_preserves_payments():
                     source_invoice_id="invoice-123",
                     source_booking_id="booking-123",
                     invoice_number="WBM02059",
+                    legacy_invoice_number="WBM01647",
+                    issue_date="2026-08-14",
                     couple_names="Example Couple",
                     wedding_date="2027-08-21",
                     total_price=1000,
@@ -177,17 +180,74 @@ def test_booking_invoice_sync_is_idempotent_and_preserves_payments():
                 assert first["invoice"]["include_in_totals"] is False
                 assert first["invoice"]["gross_received"] == 150
                 assert first["invoice"]["total_refunded"] == 0
+                assert first["invoice"]["issue_date"] == "2026-08-14"
+                assert first["invoice"]["legacy_invoice_number"] == "WBM01647"
 
                 second = await server.sync_booking_invoice(payload)
                 assert second["status"] == "already_processed"
                 assert len(fake_db.invoices.rows) == 1
                 assert len(fake_db.integration_events.rows) == 1
 
+                renumbered = payload.model_copy(update={
+                    "event_id": "event-invoice-123-chronological-number",
+                    "invoice_number": "WBM02001",
+                })
+                renumbered_result = await server.sync_booking_invoice(renumbered)
+                assert renumbered_result["invoice"]["invoice_number"] == "WBM02001"
+                assert len(fake_db.invoices.rows) == 1
+                assert not (Path(folder) / "invoices" / "WBM02059.pdf").exists()
+                assert (Path(folder) / "invoices" / "WBM02001.pdf").exists()
+
+                admin_request = DummyRequest(session={"admin_email": "mark@perfectweddingsbymark.uk"})
+                accounts_invoice_id = renumbered_result["invoice"]["id"]
+                edited = await server.emergency_edit_linked_invoice(
+                    accounts_invoice_id,
+                    {"reason": "Corrected after checking the original invoice", "total_price": 950},
+                    admin_request,
+                )
+                assert edited["total_price"] == 950
+                assert edited["balance_remaining"] == 800
+                assert edited["accounts_override"]["active"] is True
+                assert edited["accounts_override"]["action"] == "edit"
+
+                booking_changed = renumbered.model_copy(update={
+                    "event_id": "event-invoice-123-booking-change-during-override",
+                    "total_price": 1100,
+                })
+                preserved = await server.sync_booking_invoice(booking_changed)
+                assert preserved["status"] == "synchronised"
+                assert preserved["manual_override_preserved"] is True
+                assert preserved["invoice"]["total_price"] == 950
+                assert preserved["invoice"]["booking_source_snapshot"]["total_price"] == 1100
+
+                voided = await server.void_accounts_invoice(
+                    accounts_invoice_id,
+                    {"reason": "Emergency precaution while checking the records"},
+                    admin_request,
+                )
+                assert voided["status"] == "void"
+                assert voided["balance_remaining"] == 0
+                assert voided["void_reason"] == "Emergency precaution while checking the records"
+
+                restored = await server.restore_booking_invoice_values(
+                    accounts_invoice_id,
+                    {"reason": "Checks completed; return to the Booking record"},
+                    admin_request,
+                )
+                assert restored["total_price"] == 1100
+                assert restored["balance_remaining"] == 950
+                assert restored["accounts_override"]["active"] is False
+                assert [row["action"] for row in fake_db.invoice_audit_logs.rows] == [
+                    "emergency_edit", "void", "restore_booking"
+                ]
+
                 cancelled = server.BookingInvoiceSync(
                     event_id="event-invoice-123-cancelled-refunded",
                     source_invoice_id="invoice-123",
                     source_booking_id="booking-123",
-                    invoice_number="WBM02059",
+                    invoice_number="WBM02001",
+                    legacy_invoice_number="WBM01647",
+                    issue_date="2026-08-14",
                     couple_names="Example Couple",
                     wedding_date="2027-08-21",
                     total_price=1000,
@@ -246,7 +306,18 @@ def test_complete_backup_collection_list():
         "settings",
         "mileage",
         "recurring_expenses",
+        "integration_events",
+        "invoice_audit_logs",
     }
+
+
+def test_invoice_controls_are_present_in_the_admin_interface():
+    source = (BACKEND_DIR.parent / "frontend" / "src" / "pages" / "Invoices.jsx").read_text()
+    assert "/emergency-edit" in source
+    assert "/${route}" in source
+    assert "Void in Accounts" in source
+    assert "Restore Booking Values" in source
+    assert "ACCOUNTS OVERRIDE" in source
 
 
 def test_date_and_backup_filename_validation():

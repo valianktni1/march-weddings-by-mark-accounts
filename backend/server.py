@@ -44,7 +44,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.17-booking-status-hotfix-v1.3.1"
+BUILD_ID = "2026.08.17-emergency-invoice-controls-v1.3.3"
 
 # Create the main app. Documentation is disabled in production so financial
 # API routes are not advertised publicly.
@@ -257,6 +257,8 @@ class BookingInvoiceSync(BaseModel):
     source_invoice_id: str = Field(min_length=1, max_length=160)
     source_booking_id: str = Field(min_length=1, max_length=160)
     invoice_number: str = Field(min_length=1, max_length=40)
+    legacy_invoice_number: Optional[str] = Field(default=None, max_length=80)
+    issue_date: Optional[str] = None
     brand: str = Field(default="wbm", max_length=20)
     record_kind: str = Field(default="wedding", max_length=40)
     is_test: bool = False
@@ -411,6 +413,68 @@ def _delete_managed_upload(file_path: Optional[str]) -> bool:
         target.unlink()
         return True
     return False
+
+
+INVOICE_OVERRIDE_INTERNAL_FIELDS = {
+    "_id",
+    "accounts_override",
+    "booking_source_snapshot",
+    "file_path",
+    "file_name",
+    "last_booking_sync_at",
+    "updated_at",
+}
+
+
+def _invoice_source_snapshot(invoice: dict) -> dict:
+    """Return the booking-controlled values that can safely be restored later."""
+    return {
+        key: value
+        for key, value in invoice.items()
+        if key not in INVOICE_OVERRIDE_INTERNAL_FIELDS
+    }
+
+
+def _override_reason(body: dict) -> str:
+    reason = str(body.get("reason") or "").strip()
+    if len(reason) < 5:
+        raise HTTPException(status_code=422, detail="Please enter a clear reason (at least 5 characters)")
+    if len(reason) > 2000:
+        raise HTTPException(status_code=422, detail="Reason must be 2,000 characters or fewer")
+    return reason
+
+
+def _admin_from_request(request: Request) -> str:
+    return str(request.session.get("admin_email") or ADMIN_EMAIL).strip().lower()
+
+
+async def _record_invoice_audit(
+    *, invoice_id: str, invoice_number: str, action: str, reason: str,
+    admin_email: str, before: dict, after: dict,
+) -> None:
+    await db.invoice_audit_logs.insert_one({
+        "id": str(uuid.uuid4()),
+        "invoice_id": invoice_id,
+        "invoice_number": invoice_number,
+        "action": action,
+        "reason": reason,
+        "admin_email": admin_email,
+        "before": _invoice_source_snapshot(before),
+        "after": _invoice_source_snapshot(after),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def _regenerate_invoice_pdf(invoice: dict) -> dict:
+    inv_num = str(invoice.get("invoice_number") or "invoice")
+    safe_number = re.sub(r"[^A-Za-z0-9_.-]", "_", inv_num)
+    pdf_dir = UPLOAD_DIR / "invoices"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = pdf_dir / f"{safe_number}.pdf"
+    generate_invoice_pdf(invoice, str(pdf_path))
+    invoice["file_path"] = str(pdf_path)
+    invoice["file_name"] = f"{safe_number}.pdf"
+    return invoice
 
 
 @app.middleware("http")
@@ -1014,10 +1078,12 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
 
     # Invoice info row
     inv_num = invoice_data.get("invoice_number", "")
-    issue_date = invoice_data.get("created_at", "")[:10] if invoice_data.get("created_at") else ""
+    issue_date = invoice_data.get("issue_date") or (
+        invoice_data.get("created_at", "")[:10] if invoice_data.get("created_at") else ""
+    )
     try:
         from datetime import datetime as dt_mod
-        d = dt_mod.fromisoformat(issue_date)
+        d = dt_mod.strptime(issue_date, "%d/%m/%Y") if "/" in issue_date else dt_mod.fromisoformat(issue_date)
         issue_date = d.strftime("%d %b %Y")
     except:
         pass
@@ -1140,6 +1206,11 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
         cancellation_date = invoice_data.get("cancellation_date") or "Not recorded"
         elements.append(Spacer(1, 4*mm))
         elements.append(Paragraph(f"<b>Cancellation recorded {cancellation_date}.</b> {cancellation_text}<br/>No further payment is due.", small_style))
+
+    if invoice_data.get("status") == "void":
+        void_text = invoice_data.get("void_reason") or "Invoice voided in Accounts"
+        elements.append(Spacer(1, 4*mm))
+        elements.append(Paragraph(f"<b>Invoice voided.</b> {void_text}<br/>No further payment is due on this Accounts copy.", small_style))
 
     # Balance due
     if balance > 0 and bal_status == "Unpaid":
@@ -1342,6 +1413,197 @@ async def update_invoice(invoice_id: str, body: dict):
 
     updated = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
     return updated
+
+
+@api_router.put("/invoices/{invoice_id}/emergency-edit")
+async def emergency_edit_linked_invoice(invoice_id: str, body: dict, request: Request):
+    """Edit only the Accounts copy of a booking-linked invoice, with an audit lock."""
+    existing = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if existing.get("source_system") != "booking_system":
+        raise HTTPException(status_code=409, detail="Use the normal edit control for an Accounts-created invoice")
+    if _normalised_invoice_status(existing) == "void":
+        raise HTTPException(status_code=409, detail="Restore the Booking values before editing a voided linked invoice")
+
+    reason = _override_reason(body)
+    before = dict(existing)
+    source_snapshot = existing.get("booking_source_snapshot") or _invoice_source_snapshot(existing)
+    editable_fields = [
+        "couple_names", "client_address", "client_email", "client_phone",
+        "wedding_date", "venue", "total_price", "deposit_amount",
+        "deposit_paid_date", "interim_payment", "interim_payment_date",
+        "final_payment_paid_date", "package_name", "notes",
+    ]
+    changed_fields = []
+    for key in editable_fields:
+        if key in body and body[key] != existing.get(key):
+            existing[key] = body[key]
+            changed_fields.append(key)
+    if not changed_fields:
+        raise HTTPException(status_code=422, detail="No invoice values were changed")
+
+    try:
+        total = round(float(existing.get("total_price") or 0), 2)
+        deposit = round(float(existing.get("deposit_amount") or 0), 2)
+        interim = round(float(existing.get("interim_payment") or 0), 2)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invoice amounts must be valid numbers") from exc
+    if min(total, deposit, interim) < 0:
+        raise HTTPException(status_code=422, detail="Invoice amounts cannot be negative")
+
+    wedding_date = existing.get("wedding_date")
+    final_due = calc_final_payment_due(wedding_date) if wedding_date else existing.get("final_payment_due")
+    dep_date = existing.get("deposit_paid_date")
+    int_date = existing.get("interim_payment_date")
+    final_paid_date = existing.get("final_payment_paid_date")
+    balance = round(max(0, total - deposit - interim), 2)
+    if final_paid_date or balance <= 0.009:
+        status = "Paid in Full"
+        balance = 0
+    elif interim > 0 and int_date:
+        status = "Interim Paid"
+    elif deposit > 0 or dep_date:
+        status = "Deposit Paid"
+    else:
+        status = "Pending"
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    existing.update({
+        "total_price": total,
+        "deposit_amount": deposit,
+        "interim_payment": interim,
+        "final_payment_due": final_due,
+        "deposit_tax_year": calc_tax_year_from_date(dep_date) if dep_date else None,
+        "interim_tax_year": calc_tax_year_from_date(int_date) if int_date else None,
+        "final_tax_year": calc_tax_year_from_date(final_paid_date) if final_paid_date else (calc_tax_year_from_date(final_due) if final_due else None),
+        "balance_remaining": balance,
+        "status": status,
+        "tax_year": (calc_tax_year_from_date(dep_date) if dep_date else None) or calc_tax_year_from_date(wedding_date) or existing.get("tax_year", ""),
+        "include_in_totals": False,
+        "booking_source_snapshot": source_snapshot,
+        "accounts_override": {
+            "active": True,
+            "action": "edit",
+            "reason": reason,
+            "admin_email": _admin_from_request(request),
+            "changed_fields": changed_fields,
+            "created_at": now_iso,
+        },
+        "updated_at": now_iso,
+    })
+    _regenerate_invoice_pdf(existing)
+    await db.invoices.update_one({"id": invoice_id}, {"$set": existing})
+    await _record_invoice_audit(
+        invoice_id=invoice_id,
+        invoice_number=existing.get("invoice_number", ""),
+        action="emergency_edit",
+        reason=reason,
+        admin_email=_admin_from_request(request),
+        before=before,
+        after=existing,
+    )
+    existing.pop("_id", None)
+    return existing
+
+
+@api_router.post("/invoices/{invoice_id}/void")
+async def void_accounts_invoice(invoice_id: str, body: dict, request: Request):
+    """Void the Accounts copy only. This never changes Booking or emails a client."""
+    existing = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if _normalised_invoice_status(existing) == "void":
+        raise HTTPException(status_code=409, detail="Invoice is already void")
+    reason = _override_reason(body)
+    before = dict(existing)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    linked = existing.get("source_system") == "booking_system"
+    source_snapshot = existing.get("booking_source_snapshot") or _invoice_source_snapshot(existing)
+    existing.update({
+        "status": "void",
+        "balance_remaining": 0,
+        "void_reason": reason,
+        "include_in_totals": False,
+        "accounts_override": {
+            "active": True,
+            "action": "void",
+            "reason": reason,
+            "admin_email": _admin_from_request(request),
+            "changed_fields": ["status", "balance_remaining", "void_reason"],
+            "created_at": now_iso,
+        },
+        "updated_at": now_iso,
+    })
+    if linked:
+        existing["booking_source_snapshot"] = source_snapshot
+    _regenerate_invoice_pdf(existing)
+    await db.invoices.update_one({"id": invoice_id}, {"$set": existing})
+    await _record_invoice_audit(
+        invoice_id=invoice_id,
+        invoice_number=existing.get("invoice_number", ""),
+        action="void",
+        reason=reason,
+        admin_email=_admin_from_request(request),
+        before=before,
+        after=existing,
+    )
+    existing.pop("_id", None)
+    return existing
+
+
+@api_router.post("/invoices/{invoice_id}/restore-booking")
+async def restore_booking_invoice_values(invoice_id: str, body: dict, request: Request):
+    """Remove an Accounts override and restore the latest saved Booking values."""
+    existing = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if existing.get("source_system") != "booking_system":
+        raise HTTPException(status_code=409, detail="Only booking-linked invoices have Booking values to restore")
+    if not (existing.get("accounts_override") or {}).get("active"):
+        raise HTTPException(status_code=409, detail="This invoice has no active Accounts override")
+    snapshot = existing.get("booking_source_snapshot")
+    if not snapshot:
+        raise HTTPException(status_code=409, detail="No saved Booking values are available")
+
+    reason = _override_reason(body)
+    before = dict(existing)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    restored = {**existing, **snapshot}
+    restored["include_in_totals"] = False
+    restored["booking_source_snapshot"] = snapshot
+    restored["accounts_override"] = {
+        "active": False,
+        "action": "restored",
+        "reason": reason,
+        "admin_email": _admin_from_request(request),
+        "restored_at": now_iso,
+    }
+    restored["void_reason"] = snapshot.get("void_reason")
+    restored["updated_at"] = now_iso
+    _regenerate_invoice_pdf(restored)
+    await db.invoices.update_one({"id": invoice_id}, {"$set": restored})
+    await _record_invoice_audit(
+        invoice_id=invoice_id,
+        invoice_number=restored.get("invoice_number", ""),
+        action="restore_booking",
+        reason=reason,
+        admin_email=_admin_from_request(request),
+        before=before,
+        after=restored,
+    )
+    restored.pop("_id", None)
+    return restored
+
+
+@api_router.get("/invoices/{invoice_id}/audit")
+async def get_invoice_audit_history(invoice_id: str):
+    existing = await db.invoices.find_one({"id": invoice_id}, {"_id": 0, "id": 1})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return await db.invoice_audit_logs.find(
+        {"invoice_id": invoice_id}, {"_id": 0}
+    ).sort("created_at", -1).to_list(1000)
 
 
 @api_router.get("/invoices/{invoice_id}/pdf")
@@ -1562,6 +1824,8 @@ async def _sync_booking_invoice(payload: BookingInvoiceSync):
     invoice_data = {
         "id": invoice_id,
         "invoice_number": payload.invoice_number,
+        "legacy_invoice_number": payload.legacy_invoice_number,
+        "issue_date": payload.issue_date,
         "source_booking_id": payload.source_booking_id,
         "couple_names": payload.couple_names,
         "client_address": payload.client_address,
@@ -1603,6 +1867,33 @@ async def _sync_booking_invoice(payload: BookingInvoiceSync):
         "created_at": existing.get("created_at", now_iso) if existing else now_iso,
     }
 
+    source_snapshot = _invoice_source_snapshot(invoice_data)
+    if existing and (existing.get("accounts_override") or {}).get("active"):
+        await db.invoices.update_one(
+            {"id": existing["id"]},
+            {"$set": {
+                "booking_source_snapshot": source_snapshot,
+                "source_updated_at": payload.updated_at,
+                "last_booking_sync_at": now_iso,
+            }},
+        )
+        await db.integration_events.insert_one({
+            "event_id": payload.event_id,
+            "source_invoice_id": payload.source_invoice_id,
+            "invoice_number": payload.invoice_number,
+            "processed_at": now_iso,
+            "manual_override_preserved": True,
+        })
+        current = await db.invoices.find_one({"id": existing["id"]}, {"_id": 0})
+        return {
+            "status": "synchronised",
+            "source_invoice_id": payload.source_invoice_id,
+            "manual_override_preserved": True,
+            "invoice": current,
+        }
+
+    invoice_data["booking_source_snapshot"] = source_snapshot
+
     safe_number = re.sub(r"[^A-Za-z0-9_.-]", "_", payload.invoice_number)
     pdf_dir = UPLOAD_DIR / "invoices"
     pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -1610,6 +1901,7 @@ async def _sync_booking_invoice(payload: BookingInvoiceSync):
     generate_invoice_pdf(invoice_data, str(pdf_path))
     invoice_data["file_path"] = str(pdf_path)
     invoice_data["file_name"] = f"{safe_number}.pdf"
+    old_pdf_path = existing.get("file_path") if existing else None
 
     await db.invoices.update_one(
         {"source_system": "booking_system", "source_invoice_id": payload.source_invoice_id},
@@ -1622,6 +1914,8 @@ async def _sync_booking_invoice(payload: BookingInvoiceSync):
         "invoice_number": payload.invoice_number,
         "processed_at": now_iso,
     })
+    if old_pdf_path and Path(old_pdf_path).resolve() != pdf_path.resolve():
+        _delete_managed_upload(old_pdf_path)
     invoice_data.pop("_id", None)
     return {"status": "synchronised", "source_invoice_id": payload.source_invoice_id, "invoice": invoice_data}
 
@@ -2559,6 +2853,7 @@ BACKUP_COLLECTIONS = [
     "mileage",
     "recurring_expenses",
     "integration_events",
+    "invoice_audit_logs",
 ]
 BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
 
@@ -2785,6 +3080,10 @@ async def startup_checks():
         name="unique_booking_source_invoice",
     )
     await db.integration_events.create_index("event_id", unique=True, name="unique_integration_event")
+    await db.invoice_audit_logs.create_index(
+        [("invoice_id", 1), ("created_at", -1)],
+        name="invoice_audit_history",
+    )
 
 
 @app.on_event("shutdown")
