@@ -51,6 +51,13 @@ export default function TaxPrep() {
   const [cashPayment, setCashPayment] = useState(null);
   const [cashReason, setCashReason] = useState("");
   const [cashConfirmation, setCashConfirmation] = useState("");
+  const [selectedBankPayments, setSelectedBankPayments] = useState([]);
+  const [bankMatchOpen, setBankMatchOpen] = useState(false);
+  const [bankMatchMode, setBankMatchMode] = useState("create");
+  const [bankMatchRecord, setBankMatchRecord] = useState(null);
+  const [bankTransactionId, setBankTransactionId] = useState("");
+  const [bankMatchReason, setBankMatchReason] = useState("");
+  const [bankMatchConfirmation, setBankMatchConfirmation] = useState("");
 
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -74,6 +81,7 @@ export default function TaxPrep() {
       if (!(response.data || []).some((item) => item.id === taxYear) && response.data?.length) setTaxYear(response.data[0].id);
     });
   }, [taxYear]);
+  useEffect(() => { setSelectedBankPayments([]); }, [taxYear]);
   useEffect(() => { load(); }, [load]);
 
   const resetDialog = () => { setReason(""); setConfirmation(""); setAcknowledged(false); };
@@ -123,6 +131,52 @@ export default function TaxPrep() {
     } catch (error) { toast.error(errorText(error, "Cash payment could not be updated")); }
     finally { setWorking(false); }
   };
+  const toggleBankPayment = (payment) => {
+    setSelectedBankPayments((current) => current.some((item) => item.id === payment.id)
+      ? current.filter((item) => item.id !== payment.id)
+      : [...current, payment]);
+  };
+  const openBankMatchCreate = (candidates) => {
+    if (selectedBankPayments.length < 2) {
+      toast.error("Select at least two Booking payments first");
+      return;
+    }
+    setBankMatchMode("create"); setBankMatchRecord(null);
+    setBankTransactionId(candidates.length === 1 ? candidates[0].id : "");
+    setBankMatchReason("One bank transfer covers the selected Booking payment entries");
+    setBankMatchConfirmation(""); setBankMatchOpen(true);
+  };
+  const openBankMatchRemove = (match) => {
+    setBankMatchMode("remove"); setBankMatchRecord(match); setBankTransactionId("");
+    setBankMatchReason(""); setBankMatchConfirmation(""); setBankMatchOpen(true);
+  };
+  const saveBankMatch = async () => {
+    setWorking(true);
+    try {
+      if (bankMatchMode === "create") {
+        await axios.post(`${API}/tax-year-close/${taxYear}/combined-bank-matches`, {
+          bank_transaction_id: bankTransactionId,
+          payments: selectedBankPayments.map((payment) => ({
+            source_invoice_id: payment.source_invoice_id,
+            source_payment_id: payment.source_payment_id,
+          })),
+          reason: bankMatchReason,
+          confirmation: bankMatchConfirmation,
+        });
+        toast.success("Combined bank receipt matched without changing income");
+        setSelectedBankPayments([]);
+      } else {
+        await axios.post(`${API}/tax-year-close/${taxYear}/combined-bank-matches/remove`, {
+          match_id: bankMatchRecord.id,
+          reason: bankMatchReason,
+          confirmation: bankMatchConfirmation,
+        });
+        toast.success("Combined bank match removed");
+      }
+      setBankMatchOpen(false); await load(true);
+    } catch (error) { toast.error(errorText(error, "Combined bank match could not be updated")); }
+    finally { setWorking(false); }
+  };
 
   if (loading || !data) return <div className="flex min-h-[50vh] items-center justify-center text-stone-500"><RefreshCw className="mr-2 h-5 w-5 animate-spin" />Checking the tax year…</div>;
 
@@ -135,6 +189,11 @@ export default function TaxPrep() {
   const reconciliation = review.booking_reconciliation || {};
   const unmatchedPayments = reconciliation.unmatched_rows || [];
   const cashPayments = reconciliation.cash_rows || [];
+  const combinedMatches = reconciliation.combined_matches || [];
+  const selectedBankTotal = selectedBankPayments.reduce((total, payment) => total + Number(payment.amount || 0), 0);
+  const suitableBankCandidates = (reconciliation.bank_match_candidates || []).filter(
+    (transaction) => Math.abs(Number(transaction.amount || 0) - selectedBankTotal) < 0.009
+  );
 
   return (
     <div className="space-y-6 animate-fade-in" data-testid="tax-year-close-page">
@@ -184,10 +243,23 @@ export default function TaxPrep() {
       </Card>
 
       <Card className="border-stone-200">
-        <CardHeader className="border-b border-stone-100 pb-4"><div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><div><CardTitle className="flex items-center gap-2 text-lg"><Banknote className="h-5 w-5 text-[#C7A76D]" />Booking payment reconciliation</CardTitle><p className="mt-1 text-sm text-stone-500">Bank transfers are matched to your statements. Genuine cash can be confirmed without creating a fake bank transaction.</p></div><div className="flex gap-2"><Badge className="bg-emerald-100 text-emerald-800">{reconciliation.matched || 0} bank matched</Badge><Badge className="bg-sky-100 text-sky-800">{reconciliation.confirmed_cash || 0} cash</Badge><Badge className="bg-amber-100 text-amber-800">{reconciliation.unmatched || 0} unmatched</Badge></div></div></CardHeader>
+        <CardHeader className="border-b border-stone-100 pb-4"><div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><div><CardTitle className="flex items-center gap-2 text-lg"><Banknote className="h-5 w-5 text-[#C7A76D]" />Booking payment reconciliation</CardTitle><p className="mt-1 text-sm text-stone-500">Match normal transfers automatically, link several Booking entries to one combined bank receipt, or confirm genuine cash.</p></div><div className="flex flex-wrap gap-2"><Badge className="bg-emerald-100 text-emerald-800">{reconciliation.matched || 0} bank matched</Badge><Badge className="bg-violet-100 text-violet-800">{combinedMatches.length} combined</Badge><Badge className="bg-sky-100 text-sky-800">{reconciliation.confirmed_cash || 0} cash</Badge><Badge className="bg-amber-100 text-amber-800">{reconciliation.unmatched || 0} unmatched</Badge></div></div></CardHeader>
         <CardContent className="p-0">
+          {combinedMatches.length > 0 && <div className="border-b border-stone-100 p-4 sm:p-5">
+            <p className="mb-3 text-sm font-semibold text-stone-800">Combined bank receipts</p>
+            <div className="max-h-72 space-y-2 overflow-y-auto">{combinedMatches.map((match) => <div key={match.id} className="flex flex-col gap-3 rounded-lg border border-violet-100 bg-violet-50 p-3 sm:flex-row sm:items-center sm:justify-between">
+              <div><p className="font-medium text-stone-900">{match.bank_description || "Bank receipt"} · {money(match.bank_amount)}</p><p className="text-sm text-stone-600">{match.bank_date} · matched to {match.payments?.length || 0} Booking payments</p><p className="mt-1 text-xs text-stone-500">{match.payments?.map((payment) => `${payment.invoice_number} ${money(payment.amount)}`).join(" + ")}</p></div>
+              {!isClosed && <Button size="sm" variant="outline" onClick={() => openBankMatchRemove(match)}>Undo combined match</Button>}
+            </div>)}</div>
+          </div>}
           {cashPayments.length > 0 && <div className="border-b border-stone-100 p-4 sm:p-5"><p className="mb-3 text-sm font-semibold text-stone-800">Confirmed cash income</p><div className="max-h-72 space-y-2 overflow-y-auto">{cashPayments.map((payment) => <div key={payment.id} className="flex flex-col gap-3 rounded-lg border border-sky-100 bg-sky-50 p-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium text-stone-900">{payment.invoice_number} · {payment.description}</p><p className="text-sm text-stone-600">{payment.date} · {money(payment.amount)} · Cash received</p><p className="mt-1 text-xs text-stone-500">{payment.confirmation_reason}</p></div>{!isClosed && payment.confirmation_id && <Button size="sm" variant="outline" onClick={() => openCashAction(payment, "revoke")}>Undo cash confirmation</Button>}</div>)}</div></div>}
-          {unmatchedPayments.length > 0 ? <div className="p-4 sm:p-5"><p className="mb-3 text-sm font-semibold text-stone-800">Payments needing a decision</p><div className="max-h-96 space-y-2 overflow-y-auto">{unmatchedPayments.map((payment) => <div key={payment.id} className="flex flex-col gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium text-stone-900">{payment.invoice_number} · {payment.description}</p><p className="text-sm text-stone-600">{payment.date} · {money(payment.amount)} · no bank match</p></div><Button size="sm" disabled={isClosed} className="bg-[#C7A76D] text-white hover:bg-[#B8985E]" onClick={() => openCashAction(payment, "confirm")}>Confirm cash received</Button></div>)}</div></div> : cashPayments.length === 0 && <div className="flex items-center gap-3 p-6 text-emerald-800"><CheckCircle2 className="h-5 w-5" /><span className="font-medium">Every Booking payment is reconciled.</span></div>}
+          {unmatchedPayments.length > 0 ? <div className="p-4 sm:p-5">
+            <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-sm font-semibold text-stone-800">Payments needing a decision</p><p className="mt-1 text-xs text-stone-500">For one combined bank receipt, tick every Booking payment included in it.</p></div>{selectedBankPayments.length > 0 && <div className="flex flex-col gap-2 sm:items-end"><p className="text-sm font-medium text-stone-700">{selectedBankPayments.length} selected · {money(selectedBankTotal)}</p><Button size="sm" disabled={isClosed || selectedBankPayments.length < 2 || suitableBankCandidates.length === 0} onClick={() => openBankMatchCreate(suitableBankCandidates)} className="bg-violet-700 text-white hover:bg-violet-800">Match to one bank receipt</Button>{selectedBankPayments.length >= 2 && suitableBankCandidates.length === 0 && <p className="text-xs text-amber-700">No unused bank receipt equals {money(selectedBankTotal)}</p>}</div>}</div>
+            <div className="max-h-96 space-y-2 overflow-y-auto">{unmatchedPayments.map((payment) => <div key={payment.id} className={`flex flex-col gap-3 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between ${selectedBankPayments.some((item) => item.id === payment.id) ? "border-violet-300 bg-violet-50" : "border-amber-200 bg-amber-50"}`}>
+              <div className="flex min-w-0 items-start gap-3"><Checkbox checked={selectedBankPayments.some((item) => item.id === payment.id)} disabled={isClosed} onCheckedChange={() => toggleBankPayment(payment)} className="mt-1" /><div><p className="font-medium text-stone-900">{payment.invoice_number} · {payment.description}</p><p className="text-sm text-stone-600">{payment.date} · {money(payment.amount)} · no bank match</p></div></div>
+              <Button size="sm" disabled={isClosed} className="bg-[#C7A76D] text-white hover:bg-[#B8985E]" onClick={() => openCashAction(payment, "confirm")}>Confirm cash received</Button>
+            </div>)}</div>
+          </div> : cashPayments.length === 0 && <div className="flex items-center gap-3 p-6 text-emerald-800"><CheckCircle2 className="h-5 w-5" /><span className="font-medium">Every Booking payment is reconciled.</span></div>}
         </CardContent>
       </Card>
 
@@ -218,6 +290,16 @@ export default function TaxPrep() {
         <div className="space-y-2"><Label htmlFor="cash-reason">Private audit note</Label><Textarea id="cash-reason" value={cashReason} onChange={(event) => setCashReason(event.target.value)} placeholder={cashMode === "confirm" ? "For example: Final balance paid in cash at the wedding" : "Why is the cash confirmation being removed?"} /></div>
         <div className="space-y-2"><Label htmlFor="cash-confirmation">Type {cashMode === "confirm" ? "CONFIRM CASH" : "REMOVE CASH"}</Label><Input id="cash-confirmation" value={cashConfirmation} onChange={(event) => setCashConfirmation(event.target.value)} autoComplete="off" /></div>
       </div><DialogFooter><Button variant="outline" onClick={() => setCashOpen(false)}>Cancel</Button><Button onClick={saveCashAction} disabled={working || cashReason.trim().length < 5 || cashConfirmation !== (cashMode === "confirm" ? "CONFIRM CASH" : "REMOVE CASH")} className={cashMode === "confirm" ? "bg-[#C7A76D] text-white hover:bg-[#B8985E]" : "bg-amber-700 text-white hover:bg-amber-800"}>{working ? "Saving…" : cashMode === "confirm" ? "Count as cash income" : "Remove confirmation"}</Button></DialogFooter></DialogContent></Dialog>
+
+      <Dialog open={bankMatchOpen} onOpenChange={setBankMatchOpen}><DialogContent><DialogHeader><DialogTitle>{bankMatchMode === "create" ? "Match combined bank receipt" : "Undo combined bank match"}</DialogTitle><DialogDescription>{bankMatchMode === "create" ? `${selectedBankPayments.length} Booking payments total ${money(selectedBankTotal)}.` : `${bankMatchRecord?.bank_description || "Bank receipt"} · ${money(bankMatchRecord?.bank_amount)}`}</DialogDescription></DialogHeader><div className="space-y-4">
+        <div className="rounded-lg border border-violet-200 bg-violet-50 p-3 text-sm text-violet-950">{bankMatchMode === "create" ? "This links several Booking payment entries to one real bank receipt. It does not add income, create cash or alter the invoice." : "The payments will return to the unmatched list. The original bank income remains unchanged and the action stays in the audit trail."}</div>
+        {bankMatchMode === "create" && <>
+          <div className="space-y-2"><Label>Selected Booking payments</Label><div className="space-y-1 rounded-lg border border-stone-200 bg-stone-50 p-3 text-sm">{selectedBankPayments.map((payment) => <div key={payment.id} className="flex justify-between gap-3"><span>{payment.invoice_number} · {payment.description}</span><span className="shrink-0 font-mono">{money(payment.amount)}</span></div>)}<div className="mt-2 flex justify-between border-t border-stone-200 pt-2 font-semibold"><span>Total</span><span className="font-mono">{money(selectedBankTotal)}</span></div></div></div>
+          <div className="space-y-2"><Label htmlFor="combined-bank-transaction">Matching bank receipt</Label><Select value={bankTransactionId} onValueChange={setBankTransactionId}><SelectTrigger id="combined-bank-transaction"><SelectValue placeholder="Choose the bank receipt" /></SelectTrigger><SelectContent>{suitableBankCandidates.map((transaction) => <SelectItem key={transaction.id} value={transaction.id}>{transaction.date} · {transaction.description} · {money(transaction.amount)}</SelectItem>)}</SelectContent></Select></div>
+        </>}
+        <div className="space-y-2"><Label htmlFor="bank-match-reason">Private audit note</Label><Textarea id="bank-match-reason" value={bankMatchReason} onChange={(event) => setBankMatchReason(event.target.value)} placeholder={bankMatchMode === "create" ? "Why do these payments belong to this one receipt?" : "Why is this match being removed?"} /></div>
+        <div className="space-y-2"><Label htmlFor="bank-match-confirmation">Type {bankMatchMode === "create" ? "MATCH BANK" : "REMOVE BANK MATCH"}</Label><Input id="bank-match-confirmation" value={bankMatchConfirmation} onChange={(event) => setBankMatchConfirmation(event.target.value)} autoComplete="off" /></div>
+      </div><DialogFooter><Button variant="outline" onClick={() => setBankMatchOpen(false)}>Cancel</Button><Button onClick={saveBankMatch} disabled={working || bankMatchReason.trim().length < 5 || (bankMatchMode === "create" && !bankTransactionId) || bankMatchConfirmation !== (bankMatchMode === "create" ? "MATCH BANK" : "REMOVE BANK MATCH")} className="bg-violet-700 text-white hover:bg-violet-800">{working ? "Saving…" : bankMatchMode === "create" ? "Match without changing income" : "Remove combined match"}</Button></DialogFooter></DialogContent></Dialog>
     </div>
   );
 }

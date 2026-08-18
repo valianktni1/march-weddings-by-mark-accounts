@@ -213,6 +213,7 @@ def build_tax_snapshot(
     bank_statements: list[dict],
     cash_confirmations: list[dict] | None = None,
     generated_at: str,
+    bank_matches: list[dict] | None = None,
 ) -> dict:
     """Build an auditable, cash-basis snapshot without mutating source records."""
     tax_year_bounds(tax_year)
@@ -410,7 +411,88 @@ def build_tax_snapshot(
     if unmatched_manual:
         checks.append(_issue("manual_income_not_in_bank", "warning", "Manual invoice income is not present in the bank ledger", unmatched_manual, "Confirm this was cash or other genuine income before relying on the total."))
 
-    matched_booking, unmatched_booking = _match_cash_items(booking_positive_payments, [row for row in income_ledger if row.get("source") == "bank"])
+    bank_income_for_matching = [
+        row for row in income_ledger
+        if row.get("source") == "bank" and row.get("included")
+    ]
+    booking_by_key = {row["id"]: row for row in booking_positive_payments}
+    bank_by_id = {row["id"]: row for row in bank_income_for_matching}
+    used_booking_keys: set[str] = set()
+    used_bank_ids: set[str] = set()
+    manual_matched_booking: list[dict] = []
+    valid_combined_matches: list[dict] = []
+    invalid_combined_matches: list[dict] = []
+
+    for match in (bank_matches or []):
+        match_id = str(match.get("id") or "")
+        payment_keys = [str(item) for item in (match.get("payment_keys") or [])]
+        bank_id = str(match.get("bank_transaction_id") or "")
+        selected = [booking_by_key.get(key) for key in payment_keys]
+        bank_row = bank_by_id.get(bank_id)
+        problem = ""
+        if len(payment_keys) < 2 or len(set(payment_keys)) != len(payment_keys):
+            problem = "The combined match must contain at least two unique Booking payments."
+        elif any(item is None for item in selected):
+            problem = "One or more Booking payments no longer exists in this tax year."
+        elif not bank_row:
+            problem = "The linked bank-income transaction no longer exists in this tax year."
+        elif used_bank_ids.intersection({bank_id}) or used_booking_keys.intersection(payment_keys):
+            problem = "A bank transaction or Booking payment is used by more than one combined match."
+        elif money(sum(item["amount"] for item in selected if item)) != money(bank_row.get("amount")):
+            problem = "The selected Booking payments no longer equal the linked bank receipt."
+        if problem:
+            invalid_combined_matches.append({
+                "id": match_id,
+                "date": str(match.get("created_at") or ""),
+                "description": str(match.get("bank_description") or "Combined bank match"),
+                "amount": money(match.get("bank_amount")),
+                "problem": problem,
+            })
+            continue
+
+        used_bank_ids.add(bank_id)
+        used_booking_keys.update(payment_keys)
+        matched_rows = []
+        for row in selected:
+            matched_row = {
+                **row,
+                "bank_transaction_id": bank_id,
+                "bank_description": bank_row.get("description", ""),
+                "match_type": "combined bank receipt",
+                "combined_match_id": match_id,
+            }
+            manual_matched_booking.append(matched_row)
+            matched_rows.append(matched_row)
+        valid_combined_matches.append({
+            "id": match_id,
+            "bank_transaction_id": bank_id,
+            "bank_description": bank_row.get("description", ""),
+            "bank_date": bank_row.get("date", ""),
+            "bank_amount": money(bank_row.get("amount")),
+            "payment_keys": payment_keys,
+            "payments": matched_rows,
+            "reason": str(match.get("reason") or ""),
+            "created_at": str(match.get("created_at") or ""),
+            "created_by": str(match.get("created_by") or ""),
+        })
+
+    automatic_booking_rows = [row for row in booking_positive_payments if row["id"] not in used_booking_keys]
+    automatic_bank_rows = [row for row in bank_income_for_matching if row["id"] not in used_bank_ids]
+    automatic_matched_booking, unmatched_booking = _match_cash_items(automatic_booking_rows, automatic_bank_rows)
+    matched_booking = manual_matched_booking + automatic_matched_booking
+    automatically_used_bank_ids = {str(row.get("bank_transaction_id") or "") for row in automatic_matched_booking}
+    bank_match_candidates = [
+        row for row in automatic_bank_rows
+        if row["id"] not in automatically_used_bank_ids
+    ]
+    if invalid_combined_matches:
+        checks.append(_issue(
+            "invalid_combined_bank_matches",
+            "blocker",
+            "Combined bank-payment matches need attention",
+            invalid_combined_matches,
+            "Remove the invalid match and create it again against the correct bank receipt.",
+        ))
     if unmatched_booking:
         checks.append(_issue("unmatched_booking_payments", "warning", "Booking payments not matched to an imported bank receipt", unmatched_booking, "Check that every relevant bank statement has been imported; timing and combined payments can also cause unmatched items."))
 
@@ -553,6 +635,8 @@ def build_tax_snapshot(
             "matched_rows": matched_booking,
             "unmatched_rows": unmatched_booking,
             "cash_rows": booking_cash_payments,
+            "combined_matches": valid_combined_matches,
+            "bank_match_candidates": bank_match_candidates,
         },
         "manual_income_reconciliation": {
             "manual_payments": len(manual_invoice_payments),
@@ -583,6 +667,7 @@ def build_tax_snapshot(
             "invoices_reviewed": len(invoices),
             "bank_statements": len(bank_statements),
             "cash_confirmations": len(active_cash_confirmations),
+            "combined_bank_matches": len(valid_combined_matches),
         },
     }
 
@@ -791,7 +876,7 @@ def build_evidence_pack(
         cash_ids = {row.get("id") for row in snapshot["booking_reconciliation"].get("cash_rows", [])}
         (reports / "booking-bank-reconciliation.csv").write_bytes(_csv_bytes(
             ["Invoice", "Payment date", "Amount", "Treatment", "Bank description", "Cash confirmation reason"],
-            ([row.get("invoice_number", ""), row.get("date", ""), f"{money(row.get('amount')):.2f}", "Matched to bank" if row.get("id") in matched_ids else ("Cash received" if row.get("id") in cash_ids else "Unmatched"), row.get("bank_description", ""), row.get("confirmation_reason", "")] for row in reconciliation_rows),
+            ([row.get("invoice_number", ""), row.get("date", ""), f"{money(row.get('amount')):.2f}", "Combined bank receipt" if row.get("match_type") == "combined bank receipt" else ("Matched to bank" if row.get("id") in matched_ids else ("Cash received" if row.get("id") in cash_ids else "Unmatched")), row.get("bank_description", ""), row.get("confirmation_reason", "")] for row in reconciliation_rows),
         ))
         (reports / "receipt-index.csv").write_bytes(_csv_bytes(
             ["Date", "Description", "Supplier", "Amount", "Included", "Evidence file"],

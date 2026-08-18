@@ -50,7 +50,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.18-cancelled-invoice-stamp-v1.4.2"
+BUILD_ID = "2026.08.18-combined-bank-matching-v1.4.3"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -309,6 +309,24 @@ class TaxYearReopenRequest(BaseModel):
 class CashPaymentAction(BaseModel):
     source_invoice_id: str = Field(min_length=1, max_length=160)
     source_payment_id: str = Field(min_length=1, max_length=160)
+    confirmation: str = Field(min_length=1, max_length=40)
+    reason: str = Field(min_length=5, max_length=1000)
+
+
+class CombinedBankPaymentRef(BaseModel):
+    source_invoice_id: str = Field(min_length=1, max_length=160)
+    source_payment_id: str = Field(min_length=1, max_length=160)
+
+
+class CombinedBankMatchCreate(BaseModel):
+    bank_transaction_id: str = Field(min_length=1, max_length=160)
+    payments: List[CombinedBankPaymentRef] = Field(min_length=2, max_length=20)
+    confirmation: str = Field(min_length=1, max_length=40)
+    reason: str = Field(min_length=5, max_length=1000)
+
+
+class CombinedBankMatchRemove(BaseModel):
+    match_id: str = Field(min_length=1, max_length=160)
     confirmation: str = Field(min_length=1, max_length=40)
     reason: str = Field(min_length=5, max_length=1000)
 
@@ -950,6 +968,9 @@ async def _tax_close_snapshot(tax_year: str) -> dict:
     cash_confirmations = await db.cash_payment_confirmations.find(
         {"tax_year": tax_year, "active": True}, {"_id": 0}
     ).to_list(100000)
+    bank_matches = await db.booking_bank_matches.find(
+        {"tax_year": tax_year, "active": True}, {"_id": 0}
+    ).to_list(100000)
     return build_tax_snapshot(
         tax_year=tax_year,
         business_name=str(settings.get("business_name") or "Weddings by Mark"),
@@ -960,6 +981,7 @@ async def _tax_close_snapshot(tax_year: str) -> dict:
         bank_statements=bank_statements,
         cash_confirmations=cash_confirmations,
         generated_at=datetime.now(timezone.utc).isoformat(),
+        bank_matches=bank_matches,
     )
 
 
@@ -1171,6 +1193,154 @@ async def revoke_booking_cash_payment(tax_year: str, payload: CashPaymentAction,
         "reason": payload.reason.strip(), "admin_email": admin_email, "created_at": now_iso,
     })
     return {"status": "removed", **key}
+
+
+@api_router.post("/tax-year-close/{tax_year}/combined-bank-matches")
+async def create_combined_bank_match(tax_year: str, payload: CombinedBankMatchCreate, request: Request):
+    if payload.confirmation.strip() != "MATCH BANK":
+        raise HTTPException(status_code=422, detail='Type "MATCH BANK" exactly')
+    await _assert_tax_year_open(tax_year)
+
+    payment_refs = [item.model_dump() for item in payload.payments]
+    payment_keys = [f"{item['source_invoice_id']}:{item['source_payment_id']}" for item in payment_refs]
+    if len(set(payment_keys)) != len(payment_keys):
+        raise HTTPException(status_code=422, detail="Select each Booking payment only once")
+
+    bank = await db.transactions.find_one({
+        "id": payload.bank_transaction_id,
+        "tax_year": tax_year,
+    }, {"_id": 0})
+    if not bank:
+        raise HTTPException(status_code=404, detail="Bank transaction not found in this tax year")
+    if str(bank.get("transaction_type") or "").lower() != "income" or bank.get("excluded_from_totals"):
+        raise HTTPException(status_code=409, detail="The selected bank transaction must be included income")
+
+    selected_payments = []
+    for item, payment_key in zip(payment_refs, payment_keys):
+        invoice = await db.invoices.find_one({
+            "id": item["source_invoice_id"],
+            "source_system": "booking_system",
+        }, {"_id": 0})
+        if not invoice:
+            raise HTTPException(status_code=404, detail="One of the linked Booking invoices was not found")
+        payment = _booking_payment_from_invoice(invoice, item["source_payment_id"])
+        if not payment or float(payment.get("amount") or 0) <= 0:
+            raise HTTPException(status_code=404, detail="One of the selected positive Booking payments was not found")
+        if str(payment.get("payment_type") or "").lower() == "cash":
+            raise HTTPException(status_code=409, detail="A cash payment cannot be linked to a bank receipt")
+        payment_year = calc_tax_year_from_date(format_date_uk(payment.get("paid_date")))
+        if payment_year != tax_year:
+            raise HTTPException(status_code=409, detail=f"A selected payment belongs to tax year {payment_year}")
+        selected_payments.append({
+            "payment_key": payment_key,
+            "source_invoice_id": item["source_invoice_id"],
+            "source_payment_id": item["source_payment_id"],
+            "invoice_number": invoice.get("invoice_number"),
+            "client": invoice.get("couple_names") or invoice.get("client_name") or "",
+            "amount": round(float(payment.get("amount") or 0), 2),
+            "paid_date": payment.get("paid_date"),
+        })
+
+    selected_total = round(sum(item["amount"] for item in selected_payments), 2)
+    bank_amount = round(float(bank.get("amount") or 0), 2)
+    if abs(selected_total - bank_amount) > 0.009:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Selected Booking payments total £{selected_total:.2f}, but the bank receipt is £{bank_amount:.2f}",
+        )
+
+    duplicate_bank = await db.booking_bank_matches.find_one({
+        "tax_year": tax_year,
+        "bank_transaction_id": payload.bank_transaction_id,
+        "active": True,
+    }, {"_id": 0, "id": 1})
+    if duplicate_bank:
+        raise HTTPException(status_code=409, detail="That bank receipt is already used by a combined match")
+    duplicate_payment = await db.booking_bank_matches.find_one({
+        "tax_year": tax_year,
+        "payment_keys": {"$in": payment_keys},
+        "active": True,
+    }, {"_id": 0, "id": 1})
+    if duplicate_payment:
+        raise HTTPException(status_code=409, detail="One of those Booking payments is already bank-matched")
+    cash_conflict = await db.cash_payment_confirmations.find_one({
+        "tax_year": tax_year,
+        "active": True,
+        "$or": [
+            {"source_invoice_id": item["source_invoice_id"], "source_payment_id": item["source_payment_id"]}
+            for item in payment_refs
+        ],
+    }, {"_id": 0, "id": 1})
+    if cash_conflict:
+        raise HTTPException(status_code=409, detail="Undo the existing cash confirmation before matching this bank receipt")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    admin_email = _admin_from_request(request)
+    match_id = str(uuid.uuid4())
+    record = {
+        "id": match_id,
+        "tax_year": tax_year,
+        "bank_transaction_id": payload.bank_transaction_id,
+        "bank_description": bank.get("description") or "",
+        "bank_date": bank.get("date") or "",
+        "bank_amount": bank_amount,
+        "payment_keys": payment_keys,
+        "payments": selected_payments,
+        "reason": payload.reason.strip(),
+        "created_by": admin_email,
+        "created_at": now_iso,
+        "active": True,
+    }
+    await db.booking_bank_matches.insert_one(record)
+    await db.booking_bank_match_audit.insert_one({
+        "id": str(uuid.uuid4()),
+        "tax_year": tax_year,
+        "match_id": match_id,
+        "action": "combined_bank_match_created",
+        "bank_transaction_id": payload.bank_transaction_id,
+        "bank_amount": bank_amount,
+        "payment_keys": payment_keys,
+        "reason": payload.reason.strip(),
+        "admin_email": admin_email,
+        "created_at": now_iso,
+    })
+    record.pop("_id", None)
+    return record
+
+
+@api_router.post("/tax-year-close/{tax_year}/combined-bank-matches/remove")
+async def remove_combined_bank_match(tax_year: str, payload: CombinedBankMatchRemove, request: Request):
+    if payload.confirmation.strip() != "REMOVE BANK MATCH":
+        raise HTTPException(status_code=422, detail='Type "REMOVE BANK MATCH" exactly')
+    await _assert_tax_year_open(tax_year)
+    existing = await db.booking_bank_matches.find_one({
+        "id": payload.match_id,
+        "tax_year": tax_year,
+        "active": True,
+    }, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Active combined bank match not found")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    admin_email = _admin_from_request(request)
+    await db.booking_bank_matches.update_one({"id": payload.match_id}, {"$set": {
+        "active": False,
+        "removed_at": now_iso,
+        "removed_by": admin_email,
+        "removal_reason": payload.reason.strip(),
+    }})
+    await db.booking_bank_match_audit.insert_one({
+        "id": str(uuid.uuid4()),
+        "tax_year": tax_year,
+        "match_id": payload.match_id,
+        "action": "combined_bank_match_removed",
+        "bank_transaction_id": existing.get("bank_transaction_id"),
+        "bank_amount": existing.get("bank_amount"),
+        "payment_keys": existing.get("payment_keys") or [],
+        "reason": payload.reason.strip(),
+        "admin_email": admin_email,
+        "created_at": now_iso,
+    })
+    return {"status": "removed", "match_id": payload.match_id}
 
 
 @api_router.post("/tax-year-close/{tax_year}/close")
@@ -3389,6 +3559,8 @@ BACKUP_COLLECTIONS = [
     "tax_year_close_audit",
     "cash_payment_confirmations",
     "cash_payment_audit",
+    "booking_bank_matches",
+    "booking_bank_match_audit",
 ]
 BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
 
@@ -3637,6 +3809,14 @@ async def startup_checks():
     await db.cash_payment_audit.create_index(
         [("tax_year", 1), ("created_at", -1)],
         name="cash_payment_audit_history",
+    )
+    await db.booking_bank_matches.create_index(
+        [("tax_year", 1), ("bank_transaction_id", 1)],
+        name="combined_bank_match_lookup",
+    )
+    await db.booking_bank_match_audit.create_index(
+        [("tax_year", 1), ("created_at", -1)],
+        name="combined_bank_match_audit_history",
     )
 
 

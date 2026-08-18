@@ -1,0 +1,52 @@
+WEDDINGS BY MARK ACCOUNTS V1.4.3 - TRUENAS DEPLOYMENT
+======================================================
+
+This is a cumulative release and includes all V1.4, V1.4.1 and V1.4.2 work.
+
+1. Upload this complete release to the root of:
+   https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+2. Take a safe MongoDB backup:
+
+ACCOUNTS_COMBINED_MATCH_BACKUP=/mnt/nextcloud/accounts-2026-saved-data/backups/accounts-before-combined-bank-matching-v1.4.3-2026-08-18.archive.gz
+
+if [ -e "$ACCOUNTS_COMBINED_MATCH_BACKUP" ]; then
+  echo "STOP: Accounts backup already exists — nothing was overwritten"
+else
+  docker exec accounts-2026-db sh -lc 'mongodump --quiet --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --db weddings_by_mark_accounts_2026 --archive --gzip' > "$ACCOUNTS_COMBINED_MATCH_BACKUP"
+fi
+
+ls -lh "$ACCOUNTS_COMBINED_MATCH_BACKUP"
+gzip -t "$ACCOUNTS_COMBINED_MATCH_BACKUP" && echo "Accounts backup integrity OK"
+
+3. Rebuild Accounts:
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" down
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d
+
+4. Verify:
+
+docker compose -f "$ACCOUNTS_COMPOSE" ps
+curl -fsS http://127.0.0.1:30053/api/health
+echo
+
+Expected build:
+2026.08.18-combined-bank-matching-v1.4.3
+
+5. Match the Hayley receipt:
+
+   - Open Accounts > Tax Year Close.
+   - Select the correct tax year.
+   - Under Payments needing a decision, tick the £100 and £75 Booking entries.
+   - Confirm the selected total is £175.
+   - Press Match to one bank receipt.
+   - Choose the £175 bank transaction with the Hayley reference.
+   - Add/check the private note, type MATCH BANK and save.
+
+The two Booking payments will show as bank matched. Total income remains based
+on the original £175 bank receipt and is not increased.
+
+No YAML changes are required.

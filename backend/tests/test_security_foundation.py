@@ -309,6 +309,8 @@ def test_complete_backup_collection_list():
         "recurring_expenses",
         "integration_events",
         "invoice_audit_logs",
+        "booking_bank_matches",
+        "booking_bank_match_audit",
     }
 
 

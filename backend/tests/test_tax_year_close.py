@@ -79,6 +79,68 @@ def test_booking_payments_reconcile_but_never_add_invoice_income_twice():
     assert result["booking_reconciliation"]["matched"] == 1
 
 
+def test_two_booking_payments_can_match_one_combined_bank_receipt_without_double_counting():
+    result = snapshot(
+        transactions=[{
+            "id": "tx-hayley", "date": "18/08/2025", "description": "Hayley",
+            "amount": 175, "transaction_type": "income", "tax_year": "2025-26",
+            "excluded_from_totals": False,
+        }],
+        invoices=[{
+            "id": "inv-hayley", "invoice_number": "WBM02020", "couple_names": "Hayley & Partner",
+            "source_system": "booking_system", "include_in_totals": False,
+            "payments": [
+                {"id": "pay-100", "paid_date": "18/08/2025", "amount": 100, "payment_type": "bank_transfer"},
+                {"id": "pay-75", "paid_date": "18/08/2025", "amount": 75, "payment_type": "bank_transfer"},
+            ],
+        }],
+        bank_matches=[{
+            "id": "combined-1", "tax_year": "2025-26", "bank_transaction_id": "tx-hayley",
+            "bank_description": "Hayley", "bank_amount": 175,
+            "payment_keys": ["inv-hayley:pay-100", "inv-hayley:pay-75"],
+            "reason": "One bank transfer allocated across two Booking payment entries",
+            "active": True,
+        }],
+    )
+    assert result["summary"]["turnover"] == 175
+    assert result["summary"]["bank_income"] == 175
+    assert result["summary"]["other_cash_income"] == 0
+    assert result["booking_reconciliation"]["matched"] == 2
+    assert result["booking_reconciliation"]["unmatched"] == 0
+    assert len(result["booking_reconciliation"]["combined_matches"]) == 1
+    assert result["booking_reconciliation"]["bank_match_candidates"] == []
+    assert "unmatched_booking_payments" not in {
+        item["code"] for item in result["validation"]["checks"]
+    }
+
+
+def test_stale_combined_bank_match_blocks_tax_year_close():
+    result = snapshot(
+        transactions=[{
+            "id": "tx-hayley", "date": "18/08/2025", "description": "Hayley",
+            "amount": 175, "transaction_type": "income", "tax_year": "2025-26",
+            "excluded_from_totals": False,
+        }],
+        invoices=[{
+            "id": "inv-hayley", "invoice_number": "WBM02020", "couple_names": "Hayley & Partner",
+            "source_system": "booking_system", "include_in_totals": False,
+            "payments": [
+                {"id": "pay-100", "paid_date": "18/08/2025", "amount": 100},
+                {"id": "pay-50", "paid_date": "18/08/2025", "amount": 50},
+            ],
+        }],
+        bank_matches=[{
+            "id": "combined-stale", "tax_year": "2025-26", "bank_transaction_id": "tx-hayley",
+            "bank_amount": 175,
+            "payment_keys": ["inv-hayley:pay-100", "inv-hayley:pay-50"],
+            "active": True,
+        }],
+    )
+    codes = {item["code"] for item in result["validation"]["checks"]}
+    assert "invalid_combined_bank_matches" in codes
+    assert result["validation"]["ready_to_close"] is False
+
+
 def test_booking_cash_payment_is_included_once_without_a_bank_match():
     result = snapshot(invoices=[{
         "id": "inv-cash", "invoice_number": "WBM02010", "couple_names": "Cash couple",
