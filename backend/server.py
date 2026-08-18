@@ -22,6 +22,12 @@ from typing import Any, Dict, List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
+from tax_year_close import (
+    build_evidence_pack,
+    build_tax_snapshot,
+    snapshot_digest,
+    tax_year_bounds,
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -44,7 +50,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.17-emergency-invoice-controls-v1.3.3"
+BUILD_ID = "2026.08.18-tax-year-close-v1.4"
 
 # Create the main app. Documentation is disabled in production so financial
 # API routes are not advertised publicly.
@@ -76,7 +82,8 @@ STORAGE_ROOT = Path(os.environ.get("STORAGE_ROOT", str(ROOT_DIR))).resolve()
 UPLOAD_DIR = STORAGE_ROOT / "uploads"
 BACKUP_DIR = STORAGE_ROOT / "backups"
 RESTORE_DIR = STORAGE_ROOT / "temp_restore"
-for storage_dir in (UPLOAD_DIR, BACKUP_DIR, RESTORE_DIR):
+TAX_PACK_DIR = STORAGE_ROOT / "tax_year_packs"
+for storage_dir in (UPLOAD_DIR, BACKUP_DIR, RESTORE_DIR, TAX_PACK_DIR):
     storage_dir.mkdir(parents=True, exist_ok=True)
 
 # Owner withdrawal patterns to exclude from expenses
@@ -285,6 +292,23 @@ class BookingInvoiceSync(BaseModel):
 
 class BookingInvoiceBatchSync(BaseModel):
     invoices: List[BookingInvoiceSync] = Field(min_length=1, max_length=500)
+
+
+class TaxYearCloseRequest(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=5, max_length=2000)
+    acknowledge_warnings: bool = False
+
+
+class TaxYearReopenRequest(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class TransactionUpdate(BaseModel):
+    transaction_type: str = Field(pattern="^(income|expense|owner_withdrawal|tax_payment)$")
+    category: Optional[str] = Field(default=None, max_length=160)
+    excluded_from_totals: bool = False
 
 
 # Helper functions
@@ -873,6 +897,282 @@ async def export_quarter(tax_year: str, quarter: str):
 
 
 
+async def _tax_close_snapshot(tax_year: str) -> dict:
+    """Load every source ledger and build one authoritative cash-basis view."""
+    try:
+        tax_year_bounds(tax_year)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid tax year") from exc
+    settings = await get_settings()
+    transactions = await db.transactions.find({"tax_year": tax_year}, {"_id": 0}).to_list(100000)
+    expenses = await db.expenses.find({"tax_year": tax_year}, {"_id": 0}).to_list(100000)
+    mileage_entries = await db.mileage.find({"tax_year": tax_year}, {"_id": 0}).to_list(100000)
+    invoices = await db.invoices.find({}, {"_id": 0}).to_list(100000)
+    bank_statements = await db.bank_statements.find({}, {"_id": 0}).to_list(10000)
+    return build_tax_snapshot(
+        tax_year=tax_year,
+        business_name=str(settings.get("business_name") or "Weddings by Mark"),
+        transactions=transactions,
+        expenses=expenses,
+        mileage=mileage_entries,
+        invoices=invoices,
+        bank_statements=bank_statements,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+async def _tax_year_close_state(tax_year: str) -> dict:
+    record = await db.tax_year_closes.find_one({"tax_year": tax_year}, {"_id": 0})
+    return record or {"tax_year": tax_year, "status": "open", "versions": []}
+
+
+def _public_tax_year_close_state(state: dict) -> dict:
+    public = json.loads(json.dumps(state, default=str))
+    if isinstance(public.get("pack"), dict):
+        public["pack"].pop("pack_path", None)
+    for version in public.get("versions") or []:
+        if isinstance(version, dict):
+            version.pop("pack_path", None)
+    if public.get("pack"):
+        public["download_url"] = f"/api/tax-year-close/{public['tax_year']}/download"
+    return public
+
+
+async def _assert_tax_year_open(tax_year: Optional[str]) -> None:
+    """Prevent accidental changes to records in a formally closed tax year."""
+    if not tax_year:
+        return
+    record = await db.tax_year_closes.find_one({"tax_year": tax_year, "status": "closed"}, {"_id": 0, "tax_year": 1})
+    if record:
+        raise HTTPException(
+            status_code=423,
+            detail=f"Tax year {tax_year} is closed. Reopen it from Tax Year Close before changing its records.",
+        )
+
+
+async def _assert_tax_years_open(tax_years: set[str]) -> None:
+    for tax_year in sorted(item for item in tax_years if item):
+        await _assert_tax_year_open(tax_year)
+
+
+def _invoice_cash_tax_years(invoice: dict) -> set[str]:
+    years = {
+        invoice.get("deposit_tax_year"),
+        invoice.get("interim_tax_year"),
+        calc_tax_year_from_date(invoice.get("final_payment_paid_date")) if invoice.get("final_payment_paid_date") else None,
+    }
+    for payment in invoice.get("payments") or []:
+        if payment.get("paid_date"):
+            years.add(calc_tax_year_from_date(format_date_uk(payment.get("paid_date"))))
+    if invoice.get("include_in_totals") and invoice.get("tax_year"):
+        years.add(invoice.get("tax_year"))
+    return {str(item) for item in years if item}
+
+
+def _safe_evidence_source(file_path: Any) -> Optional[Path]:
+    if not file_path:
+        return None
+    source = Path(str(file_path)).resolve()
+    try:
+        source.relative_to(UPLOAD_DIR.resolve())
+    except ValueError:
+        logger.warning("Tax pack skipped evidence outside the managed upload root: %s", source)
+        return None
+    return source if source.is_file() else None
+
+
+async def _tax_pack_evidence(snapshot: dict) -> list[dict]:
+    evidence: list[dict] = []
+    expenses_by_id = {
+        row.get("id"): row
+        for row in await db.expenses.find({"tax_year": snapshot["tax_year"]}, {"_id": 0}).to_list(100000)
+    }
+    for indexed in snapshot.get("receipt_index", []):
+        record = expenses_by_id.get(indexed.get("expense_id")) or {}
+        source = _safe_evidence_source(record.get("file_path"))
+        if source:
+            evidence.append({
+                "category": "receipts",
+                "source_path": str(source),
+                "file_name": record.get("file_name") or source.name,
+                "record_id": record.get("id"),
+            })
+
+    statement_ids = {row.get("bank_statement_id") for row in snapshot.get("transaction_ledger", []) if row.get("bank_statement_id")}
+    statements = await db.bank_statements.find({"id": {"$in": list(statement_ids)}}, {"_id": 0}).to_list(10000) if statement_ids else []
+    for record in statements:
+        source = _safe_evidence_source(record.get("file_path"))
+        if source:
+            evidence.append({
+                "category": "bank-statements",
+                "source_path": str(source),
+                "file_name": record.get("file_name") or source.name,
+                "record_id": record.get("id"),
+            })
+
+    invoice_ids = {row.get("invoice_id") for row in snapshot.get("invoice_payment_audit", []) if row.get("invoice_id")}
+    invoices = await db.invoices.find({"id": {"$in": list(invoice_ids)}}, {"_id": 0}).to_list(100000) if invoice_ids else []
+    for record in invoices:
+        source = _safe_evidence_source(record.get("file_path"))
+        if source:
+            evidence.append({
+                "category": "invoices",
+                "source_path": str(source),
+                "file_name": record.get("file_name") or source.name,
+                "record_id": record.get("id"),
+            })
+    return evidence
+
+
+@api_router.get("/tax-year-close/{tax_year}")
+async def get_tax_year_close(tax_year: str):
+    snapshot = await _tax_close_snapshot(tax_year)
+    close_state = await _tax_year_close_state(tax_year)
+    public_snapshot = {
+        key: value for key, value in snapshot.items()
+        if key not in {"transaction_ledger", "income_ledger", "expense_ledger", "mileage_ledger", "invoice_payment_audit", "receipt_index", "bank_statements"}
+    }
+    if isinstance(public_snapshot.get("booking_reconciliation"), dict):
+        public_snapshot["booking_reconciliation"].pop("matched_rows", None)
+        public_snapshot["booking_reconciliation"].pop("unmatched_rows", None)
+    return {"close": _public_tax_year_close_state(close_state), "review": public_snapshot}
+
+
+@api_router.get("/tax-year-close/{tax_year}/history")
+async def get_tax_year_close_history(tax_year: str):
+    try:
+        tax_year_bounds(tax_year)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid tax year") from exc
+    return await db.tax_year_close_audit.find(
+        {"tax_year": tax_year}, {"_id": 0}
+    ).sort("created_at", -1).to_list(1000)
+
+
+@api_router.post("/tax-year-close/{tax_year}/close")
+async def close_tax_year(tax_year: str, payload: TaxYearCloseRequest, request: Request):
+    expected = f"CLOSE {tax_year}"
+    if payload.confirmation.strip() != expected:
+        raise HTTPException(status_code=422, detail=f'Type "{expected}" exactly to close this tax year')
+    state = await _tax_year_close_state(tax_year)
+    if state.get("status") == "closed":
+        raise HTTPException(status_code=409, detail=f"Tax year {tax_year} is already closed")
+    snapshot = await _tax_close_snapshot(tax_year)
+    validation = snapshot["validation"]
+    if validation["blocker_count"]:
+        raise HTTPException(status_code=409, detail={
+            "message": "Resolve every blocking check before closing this tax year",
+            "validation": validation,
+        })
+    if validation["warning_count"] and not payload.acknowledge_warnings:
+        raise HTTPException(status_code=422, detail="Review and acknowledge the warnings before closing")
+
+    version_number = len(state.get("versions") or []) + 1
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_dir = TAX_PACK_DIR / tax_year
+    output_path = output_dir / f"weddings_by_mark_tax_year_{tax_year}_v{version_number}_{stamp}.zip"
+    evidence_files = await _tax_pack_evidence(snapshot)
+    pack = await asyncio.to_thread(
+        build_evidence_pack,
+        snapshot=snapshot,
+        output_path=output_path,
+        build_id=BUILD_ID,
+        evidence_files=evidence_files,
+        logo_path=ROOT_DIR / "logo.png",
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    admin_email = _admin_from_request(request)
+    version = {
+        "version": version_number,
+        "closed_at": now_iso,
+        "closed_by": admin_email,
+        "reason": payload.reason.strip(),
+        "summary": snapshot["summary"],
+        "validation": validation,
+        "source_counts": snapshot["source_counts"],
+        **pack,
+    }
+    await db.tax_year_closes.update_one(
+        {"tax_year": tax_year},
+        {
+            "$set": {
+                "tax_year": tax_year,
+                "status": "closed",
+                "active_version": version_number,
+                "closed_at": now_iso,
+                "closed_by": admin_email,
+                "reason": payload.reason.strip(),
+                "summary": snapshot["summary"],
+                "validation": validation,
+                "pack": pack,
+                "snapshot_sha256": snapshot_digest(snapshot),
+                "updated_at": now_iso,
+            },
+            "$push": {"versions": version},
+        },
+        upsert=True,
+    )
+    await db.tax_year_close_audit.insert_one({
+        "id": str(uuid.uuid4()),
+        "tax_year": tax_year,
+        "action": "closed",
+        "version": version_number,
+        "reason": payload.reason.strip(),
+        "admin_email": admin_email,
+        "snapshot_sha256": pack["snapshot_sha256"],
+        "pack_sha256": pack["pack_sha256"],
+        "created_at": now_iso,
+    })
+    return _public_tax_year_close_state(await _tax_year_close_state(tax_year))
+
+
+@api_router.post("/tax-year-close/{tax_year}/reopen")
+async def reopen_tax_year(tax_year: str, payload: TaxYearReopenRequest, request: Request):
+    expected = f"REOPEN {tax_year}"
+    if payload.confirmation.strip() != expected:
+        raise HTTPException(status_code=422, detail=f'Type "{expected}" exactly to reopen this tax year')
+    state = await _tax_year_close_state(tax_year)
+    if state.get("status") != "closed":
+        raise HTTPException(status_code=409, detail=f"Tax year {tax_year} is not closed")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    admin_email = _admin_from_request(request)
+    await db.tax_year_closes.update_one(
+        {"tax_year": tax_year},
+        {"$set": {
+            "status": "open",
+            "reopened_at": now_iso,
+            "reopened_by": admin_email,
+            "reopen_reason": payload.reason.strip(),
+            "updated_at": now_iso,
+        }},
+    )
+    await db.tax_year_close_audit.insert_one({
+        "id": str(uuid.uuid4()),
+        "tax_year": tax_year,
+        "action": "reopened",
+        "version": state.get("active_version"),
+        "reason": payload.reason.strip(),
+        "admin_email": admin_email,
+        "created_at": now_iso,
+    })
+    return _public_tax_year_close_state(await _tax_year_close_state(tax_year))
+
+
+@api_router.get("/tax-year-close/{tax_year}/download")
+async def download_tax_year_pack(tax_year: str):
+    state = await _tax_year_close_state(tax_year)
+    pack = state.get("pack") or {}
+    file_path = Path(str(pack.get("pack_path") or "")).resolve()
+    pack_root = TAX_PACK_DIR.resolve()
+    try:
+        file_path.relative_to(pack_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="No closed tax-year pack is available") from exc
+    if state.get("status") not in {"closed", "open"} or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="No closed tax-year pack is available")
+    return FileResponse(file_path, filename=pack.get("pack_filename") or file_path.name, media_type="application/zip")
+
+
 # Invoice endpoints
 
 @api_router.post("/invoices/scan-pdf")
@@ -1279,6 +1579,8 @@ async def create_invoice(invoice: InvoiceCreate):
 
     # Main tax_year = deposit tax year for filtering
     main_tax_year = deposit_tax_year or calc_tax_year_from_date(invoice.wedding_date) or ""
+    if invoice.include_in_totals:
+        await _assert_tax_years_open({deposit_tax_year, interim_tax_year, final_tax_year, main_tax_year})
 
     invoice_data = {
         "id": str(uuid.uuid4()),
@@ -1339,6 +1641,7 @@ async def update_invoice(invoice_id: str, body: dict):
         raise HTTPException(status_code=404, detail="Invoice not found")
     if existing.get("source_system") == "booking_system":
         raise HTTPException(status_code=409, detail="Linked invoices are edited in the booking system")
+    await _assert_tax_years_open(_invoice_cash_tax_years(existing))
 
     # Merge updates
     for key in ["couple_names", "client_address", "client_email", "client_phone",
@@ -1425,6 +1728,7 @@ async def emergency_edit_linked_invoice(invoice_id: str, body: dict, request: Re
         raise HTTPException(status_code=409, detail="Use the normal edit control for an Accounts-created invoice")
     if _normalised_invoice_status(existing) == "void":
         raise HTTPException(status_code=409, detail="Restore the Booking values before editing a voided linked invoice")
+    await _assert_tax_years_open(_invoice_cash_tax_years(existing))
 
     reason = _override_reason(body)
     before = dict(existing)
@@ -1515,6 +1819,7 @@ async def void_accounts_invoice(invoice_id: str, body: dict, request: Request):
         raise HTTPException(status_code=404, detail="Invoice not found")
     if _normalised_invoice_status(existing) == "void":
         raise HTTPException(status_code=409, detail="Invoice is already void")
+    await _assert_tax_years_open(_invoice_cash_tax_years(existing))
     reason = _override_reason(body)
     before = dict(existing)
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1562,6 +1867,7 @@ async def restore_booking_invoice_values(invoice_id: str, body: dict, request: R
         raise HTTPException(status_code=409, detail="Only booking-linked invoices have Booking values to restore")
     if not (existing.get("accounts_override") or {}).get("active"):
         raise HTTPException(status_code=409, detail="This invoice has no active Accounts override")
+    await _assert_tax_years_open(_invoice_cash_tax_years(existing))
     snapshot = existing.get("booking_source_snapshot")
     if not snapshot:
         raise HTTPException(status_code=409, detail="No saved Booking values are available")
@@ -1624,6 +1930,7 @@ async def delete_invoice(invoice_id: str):
         raise HTTPException(status_code=404, detail="Invoice not found")
     if invoice.get("source_system") == "booking_system":
         raise HTTPException(status_code=409, detail="Linked invoices are retained and controlled by the booking system")
+    await _assert_tax_years_open(_invoice_cash_tax_years(invoice))
     result = await db.invoices.delete_one({"id": invoice_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -1730,6 +2037,7 @@ async def update_invoice_status(invoice_id: str, body: dict):
         raise HTTPException(status_code=404, detail="Invoice not found")
     if existing.get("source_system") == "booking_system":
         raise HTTPException(status_code=409, detail="Linked invoice status is controlled by the booking system")
+    await _assert_tax_years_open(_invoice_cash_tax_years(existing))
     status = body.get("status", "pending")
     result = await db.invoices.update_one(
         {"id": invoice_id},
@@ -1746,6 +2054,7 @@ async def update_invoice_paid(invoice_id: str, body: dict):
         raise HTTPException(status_code=404, detail="Invoice not found")
     if existing.get("source_system") == "booking_system":
         raise HTTPException(status_code=409, detail="Linked invoice payments are controlled by the booking system")
+    await _assert_tax_years_open(_invoice_cash_tax_years(existing))
     paid = body.get("paid", 0)
     result = await db.invoices.update_one(
         {"id": invoice_id},
@@ -2038,6 +2347,7 @@ async def scan_expense_pdf(file: UploadFile = File(...)):
 @api_router.post("/expenses", response_model=Expense)
 async def create_expense(expense: ExpenseCreate):
     expense_data = expense.model_dump()
+    await _assert_tax_year_open(expense_data.get("tax_year"))
     include_amount = expense_data.pop("include_amount", True)
     
     if not include_amount:
@@ -2060,6 +2370,7 @@ async def upload_expense(
     supplier: Optional[str] = Form(None),
     include_amount: bool = Form(True)
 ):
+    await _assert_tax_year_open(tax_year)
     # Save file
     file_id = str(uuid.uuid4())
     content, file_ext, original_name = await _read_upload(file, {".pdf", ".png", ".jpg", ".jpeg", ".webp"})
@@ -2113,6 +2424,7 @@ async def delete_expense(expense_id: str):
     expense = await db.expenses.find_one({"id": expense_id}, {"_id": 0})
     if not expense:
         raise HTTPException(status_code=404, detail="Expense not found")
+    await _assert_tax_year_open(expense.get("tax_year"))
     result = await db.expenses.delete_one({"id": expense_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Expense not found")
@@ -2130,10 +2442,42 @@ async def get_transactions(tax_year: Optional[str] = None):
     return transactions
 
 
+@api_router.put("/transactions/{transaction_id}")
+async def update_transaction(transaction_id: str, payload: TransactionUpdate):
+    transaction = await db.transactions.find_one({"id": transaction_id}, {"_id": 0})
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    await _assert_tax_year_open(transaction.get("tax_year"))
+    category = (payload.category or "").strip() or None
+    if payload.transaction_type == "expense" and not payload.excluded_from_totals and not category:
+        raise HTTPException(status_code=422, detail="Choose a category for an included expense")
+    updates = {
+        "transaction_type": payload.transaction_type,
+        "category": category,
+        "excluded_from_totals": payload.excluded_from_totals,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.transactions.update_one({"id": transaction_id}, {"$set": updates})
+    return await db.transactions.find_one({"id": transaction_id}, {"_id": 0})
+
+
+@api_router.delete("/transactions/{transaction_id}")
+async def delete_transaction(transaction_id: str):
+    transaction = await db.transactions.find_one({"id": transaction_id}, {"_id": 0})
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    await _assert_tax_year_open(transaction.get("tax_year"))
+    await db.transactions.delete_one({"id": transaction_id})
+    await db.expenses.delete_many({"source_transaction_id": transaction_id, "is_from_bank": True})
+    return {"status": "deleted"}
+
+
 # Bank Statement endpoints
 @api_router.delete("/bank-statements/all")
 async def delete_all_bank_data():
     """Delete all bank statements and their associated transactions"""
+    tax_years = set(await db.transactions.distinct("tax_year", {"source": "bank_statement"}))
+    await _assert_tax_years_open(tax_years)
     statements = await db.bank_statements.find({}, {"_id": 0, "file_path": 1}).to_list(10000)
     tx_result = await db.transactions.delete_many({"source": "bank_statement"})
     bs_result = await db.bank_statements.delete_many({})
@@ -2188,6 +2532,7 @@ async def parse_bank_statement(statement_id: str):
         # Parse CSV locally - no AI, no cost
         try:
             transactions = parse_tide_csv(file_path)
+            await _assert_tax_years_open({tx.tax_year for tx in transactions})
             created_count = 0
             skipped = 0
             for tx in transactions:
@@ -2386,6 +2731,25 @@ async def parse_statement_background(statement_id: str, file_path: str):
                 response_text = response_text[:-3]
 
             parsed_transactions = json.loads(response_text.strip())
+
+            affected_years = {
+                get_tax_year_from_date(format_date_uk(item.get("date", "")))
+                for item in parsed_transactions
+            }
+            closed_year = await thread_db.tax_year_closes.find_one(
+                {"tax_year": {"$in": list(affected_years)}, "status": "closed"},
+                {"_id": 0, "tax_year": 1},
+            )
+            if closed_year:
+                await thread_db.bank_statements.update_one(
+                    {"id": statement_id},
+                    {"$set": {
+                        "parse_status": "error",
+                        "parse_error": f"Tax year {closed_year['tax_year']} is closed. Reopen it before importing this statement.",
+                    }},
+                )
+                thread_client.close()
+                return
             
             # Process transactions
             created_count = 0
@@ -2421,6 +2785,13 @@ async def parse_statement_background(statement_id: str, file_path: str):
                 )
                 
                 doc = transaction.model_dump()
+                duplicate = await thread_db.transactions.find_one({
+                    "date": doc["date"],
+                    "description": doc["description"],
+                    "amount": doc["amount"],
+                })
+                if duplicate:
+                    continue
                 await thread_db.transactions.insert_one(doc)
                 created_count += 1
             
@@ -2470,6 +2841,8 @@ async def delete_bank_statement(statement_id: str):
     statement = await db.bank_statements.find_one({"id": statement_id}, {"_id": 0})
     if not statement:
         raise HTTPException(status_code=404, detail="Statement not found")
+    tax_years = set(await db.transactions.distinct("tax_year", {"bank_statement_id": statement_id}))
+    await _assert_tax_years_open(tax_years)
     
     # Delete all transactions from this statement
     result = await db.transactions.delete_many({"bank_statement_id": statement_id})
@@ -2508,61 +2881,23 @@ async def get_bank_statements():
 # Summary endpoints
 @api_router.get("/summary/{tax_year}")
 async def get_summary(tax_year: str):
-    """Get financial summary for a tax year — invoices are tracking only, not income"""
-    
-    # Get expenses
-    expenses = await db.expenses.find({"tax_year": tax_year}, {"_id": 0}).to_list(10000)
-    total_expenses = sum(exp.get("amount", 0) for exp in expenses)
-    
-    # Get mileage claims
-    mileage_entries = await db.mileage.find({"tax_year": tax_year}, {"_id": 0}).to_list(10000)
-    mileage_total = sum(e.get("amount", 0) for e in mileage_entries)
-    total_expenses += mileage_total
-    
-    # Get bank transactions (excluding owner withdrawals)
-    transactions = await db.transactions.find({
-        "tax_year": tax_year,
-        "excluded_from_totals": False
-    }, {"_id": 0}).to_list(10000)
-    
-    bank_income = sum(tx.get("amount", 0) for tx in transactions if tx.get("transaction_type") == "income")
-    bank_expenses = sum(tx.get("amount", 0) for tx in transactions if tx.get("transaction_type") == "expense")
-    
-    # Get excluded transactions
-    excluded_transactions = await db.transactions.find({
-        "tax_year": tax_year,
-        "excluded_from_totals": True
-    }, {"_id": 0}).to_list(10000)
-    
-    owner_withdrawals = sum(tx.get("amount", 0) for tx in excluded_transactions if tx.get("transaction_type") == "owner_withdrawal")
-    tax_payments = sum(tx.get("amount", 0) for tx in excluded_transactions if tx.get("transaction_type") == "tax_payment")
-    
-    # Invoices are for tracking only — unless include_in_totals is set
-    invoices = await db.invoices.find({"tax_year": tax_year}, {"_id": 0}).to_list(10000)
-    
-    # Sum income from invoices marked as "add to income"
-    invoice_income = 0
-    for inv in invoices:
-        if inv.get("include_in_totals"):
-            invoice_income += inv.get("total_price", 0)
-    
-    total_income = bank_income + invoice_income
-    net_profit = total_income - (total_expenses + bank_expenses)
-    
+    """Return the same authoritative cash-basis figures used at tax-year close."""
+    snapshot = await _tax_close_snapshot(tax_year)
+    summary = snapshot["summary"]
     return {
         "tax_year": tax_year,
-        "total_income": total_income,
-        "bank_income": bank_income,
-        "invoice_income": invoice_income,
-        "total_expenses": total_expenses + bank_expenses,
-        "manual_expenses": total_expenses,
-        "bank_expenses": bank_expenses,
-        "net_profit": net_profit,
-        "owner_withdrawals": owner_withdrawals,
-        "tax_payments": tax_payments,
-        "invoice_count": len(invoices),
-        "expense_count": len(expenses),
-        "transaction_count": len(transactions)
+        "total_income": summary["turnover"],
+        "bank_income": summary["bank_income"],
+        "invoice_income": summary["other_cash_income"],
+        "total_expenses": summary["allowable_expenses"],
+        "manual_expenses": round(summary["manual_expenses"] + summary["mileage"], 2),
+        "bank_expenses": summary["bank_expenses"],
+        "net_profit": summary["net_profit"],
+        "owner_withdrawals": summary["owner_withdrawals"],
+        "tax_payments": summary["tax_payments"],
+        "invoice_count": snapshot["source_counts"]["invoices_reviewed"],
+        "expense_count": snapshot["source_counts"]["manual_expenses"],
+        "transaction_count": snapshot["source_counts"]["transactions"],
     }
 
 
@@ -2592,31 +2927,24 @@ async def get_dashboard_extras(tax_year: str):
         year = start_year if month >= 4 else start_year + 1
         months.append({"year": year, "month": month})
 
-    transactions = await db.transactions.find({"tax_year": tax_year, "excluded_from_totals": False}, {"_id": 0}).to_list(10000)
-    expenses = await db.expenses.find({"tax_year": tax_year}, {"_id": 0}).to_list(10000)
-    invoices_income = await db.invoices.find({"tax_year": tax_year, "include_in_totals": True}, {"_id": 0}).to_list(10000)
-    mileage_entries = await db.mileage.find({"tax_year": tax_year}, {"_id": 0}).to_list(10000)
+    snapshot = await _tax_close_snapshot(tax_year)
+    income_rows = [row for row in snapshot["income_ledger"] if row.get("included")]
+    expense_rows = [row for row in snapshot["expense_ledger"] if row.get("included")]
+    mileage_entries = snapshot["mileage_ledger"]
 
     month_labels = ["Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar"]
     monthly_data = []
     for i, m in enumerate(months):
         m_income = 0
         m_expenses = 0
-        for tx in transactions:
-            dt = parse_date(tx.get("date", ""))
+        for row in income_rows:
+            dt = parse_date(row.get("date", ""))
             if dt and dt.month == m["month"] and dt.year == m["year"]:
-                if tx.get("transaction_type") == "income":
-                    m_income += tx.get("amount", 0)
-                elif tx.get("transaction_type") == "expense":
-                    m_expenses += tx.get("amount", 0)
-        for exp in expenses:
-            dt = parse_date(exp.get("date", ""))
+                m_income += row.get("amount", 0)
+        for row in expense_rows:
+            dt = parse_date(row.get("date", ""))
             if dt and dt.month == m["month"] and dt.year == m["year"]:
-                m_expenses += exp.get("amount", 0)
-        for inv in invoices_income:
-            dep_dt = parse_date(inv.get("deposit_paid_date", ""))
-            if dep_dt and dep_dt.month == m["month"] and dep_dt.year == m["year"]:
-                m_income += inv.get("total_price", 0)
+                m_expenses += row.get("amount", 0)
         for ml in mileage_entries:
             dt = parse_date(ml.get("date", ""))
             if dt and dt.month == m["month"] and dt.year == m["year"]:
@@ -2629,18 +2957,10 @@ async def get_dashboard_extras(tax_year: str):
         })
 
     # Expense category breakdown
-    category_totals = {}
-    for tx in transactions:
-        if tx.get("transaction_type") == "expense":
-            cat = tx.get("category") or "Uncategorised"
-            category_totals[cat] = category_totals.get(cat, 0) + tx.get("amount", 0)
-    for exp in expenses:
-        cat = exp.get("category") or "Uncategorised"
-        category_totals[cat] = category_totals.get(cat, 0) + exp.get("amount", 0)
-    mileage_total = sum(m.get("amount", 0) for m in mileage_entries)
-    if mileage_total > 0:
-        category_totals["Travel & Mileage"] = category_totals.get("Travel & Mileage", 0) + mileage_total
-    categories = [{"name": k, "value": round(v, 2)} for k, v in sorted(category_totals.items(), key=lambda x: -x[1]) if v > 0]
+    categories = [
+        {"name": item["category"], "value": item["amount"]}
+        for item in snapshot["category_summary"]
+    ]
 
     # Overdue invoices
     all_invoices = await db.invoices.find({}, {"_id": 0}).to_list(10000)
@@ -2685,6 +3005,7 @@ async def get_mileage(tax_year: str = None):
 async def create_mileage(entry: dict):
     miles = float(entry.get("miles", 0))
     tax_year = entry.get("tax_year", "")
+    await _assert_tax_year_open(tax_year)
     existing = await db.mileage.find({"tax_year": tax_year}, {"_id": 0}).to_list(10000)
     total_existing = sum(e.get("miles", 0) for e in existing)
 
@@ -2725,6 +3046,10 @@ async def create_mileage(entry: dict):
 
 @api_router.delete("/mileage/{entry_id}")
 async def delete_mileage(entry_id: str):
+    entry = await db.mileage.find_one({"id": entry_id}, {"_id": 0})
+    if not entry:
+        raise HTTPException(status_code=404, detail="Mileage entry not found")
+    await _assert_tax_year_open(entry.get("tax_year"))
     await db.mileage.delete_one({"id": entry_id})
     return {"status": "deleted"}
 
@@ -2732,6 +3057,7 @@ async def delete_mileage(entry_id: str):
 @api_router.post("/mileage/recalculate/{tax_year}")
 async def recalculate_mileage(tax_year: str):
     """Recalculate all mileage amounts for a tax year using the correct HMRC rate"""
+    await _assert_tax_year_open(tax_year)
     entries = await db.mileage.find({"tax_year": tax_year}, {"_id": 0}).to_list(10000)
     if not entries:
         return {"recalculated": 0}
@@ -2798,6 +3124,7 @@ async def create_from_recurring(template_id: str, body: dict):
         raise HTTPException(status_code=404, detail="Template not found")
     date = body.get("date", datetime.now().strftime("%d/%m/%Y"))
     tax_year = body.get("tax_year", get_tax_year_from_date(date))
+    await _assert_tax_year_open(tax_year)
     expense_data = {
         "id": str(uuid.uuid4()),
         "description": template["description"],
@@ -2822,6 +3149,7 @@ async def transaction_to_expense(transaction_id: str, body: dict):
     tx = await db.transactions.find_one({"id": transaction_id}, {"_id": 0})
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
+    await _assert_tax_year_open(tx.get("tax_year"))
     category = body.get("category", "Other")
     expense_data = {
         "id": str(uuid.uuid4()),
@@ -2832,6 +3160,7 @@ async def transaction_to_expense(transaction_id: str, body: dict):
         "date": tx.get("date", ""),
         "tax_year": tx.get("tax_year", ""),
         "is_from_bank": True,
+        "source_transaction_id": transaction_id,
         "file_path": None,
         "file_name": None,
         "created_at": datetime.now(timezone.utc).isoformat()
@@ -2854,6 +3183,8 @@ BACKUP_COLLECTIONS = [
     "recurring_expenses",
     "integration_events",
     "invoice_audit_logs",
+    "tax_year_closes",
+    "tax_year_close_audit",
 ]
 BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
 
@@ -2876,7 +3207,7 @@ async def _build_backup() -> tuple[str, Dict[str, int]]:
 
         manifest = {
             "format": "weddings-by-mark-accounts-backup",
-            "version": 2,
+            "version": 3,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "build": BUILD_ID,
             "collections": totals,
@@ -2886,6 +3217,8 @@ async def _build_backup() -> tuple[str, Dict[str, int]]:
 
         if UPLOAD_DIR.exists():
             shutil.copytree(UPLOAD_DIR, temp_backup_dir / "uploads", dirs_exist_ok=True)
+        if TAX_PACK_DIR.exists():
+            shutil.copytree(TAX_PACK_DIR, temp_backup_dir / "tax_year_packs", dirs_exist_ok=True)
 
         zip_path = backup_root / f"{backup_name}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -2991,6 +3324,9 @@ async def restore_backup(file: UploadFile = File(...)):
         uploads_dir = extract_dir / "uploads"
         if uploads_dir.exists():
             shutil.copytree(uploads_dir, UPLOAD_DIR, dirs_exist_ok=True)
+        tax_packs_dir = extract_dir / "tax_year_packs"
+        if tax_packs_dir.exists():
+            shutil.copytree(tax_packs_dir, TAX_PACK_DIR, dirs_exist_ok=True)
 
         return {
             "status": "success",
@@ -3083,6 +3419,11 @@ async def startup_checks():
     await db.invoice_audit_logs.create_index(
         [("invoice_id", 1), ("created_at", -1)],
         name="invoice_audit_history",
+    )
+    await db.tax_year_closes.create_index("tax_year", unique=True, name="unique_tax_year_close")
+    await db.tax_year_close_audit.create_index(
+        [("tax_year", 1), ("created_at", -1)],
+        name="tax_year_close_history",
     )
 
 

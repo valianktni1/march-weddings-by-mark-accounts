@@ -144,6 +144,7 @@ def test_booking_invoice_sync_is_idempotent_and_preserves_payments():
             self.invoices = Collection()
             self.integration_events = Collection()
             self.invoice_audit_logs = Collection()
+            self.tax_year_closes = Collection()
 
     async def run():
         original_db = server.db

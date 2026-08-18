@@ -1,0 +1,66 @@
+ACCOUNTS 2026 TAX YEAR CLOSE V1.4 — SAFE TRUENAS DEPLOYMENT
+================================================================
+
+No YAML changes are needed for this release.
+
+1. BACK UP MONGODB BEFORE DEPLOYING
+----------------------------------
+
+ACCOUNTS_TAX_CLOSE_BACKUP=/mnt/nextcloud/accounts-2026-saved-data/backups/accounts-before-tax-year-close-v1.4-2026-08-18.archive.gz
+
+if [ -e "$ACCOUNTS_TAX_CLOSE_BACKUP" ]; then
+  echo "STOP: Backup already exists — nothing was overwritten"
+else
+  docker exec accounts-2026-db sh -lc 'mongodump --quiet --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --db weddings_by_mark_accounts_2026 --archive --gzip' > "$ACCOUNTS_TAX_CLOSE_BACKUP"
+fi
+
+ls -lh "$ACCOUNTS_TAX_CLOSE_BACKUP"
+gzip -t "$ACCOUNTS_TAX_CLOSE_BACKUP" && echo "Accounts backup integrity OK"
+
+
+2. REDEPLOY THE COMPLETE APP
+----------------------------
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" down
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d
+
+
+3. WAIT FOR HEALTH, THEN CHECK
+------------------------------
+
+docker compose -f "$ACCOUNTS_COMPOSE" ps
+curl -fsS http://127.0.0.1:30053/api/health
+echo
+
+Expected build:
+2026.08.18-tax-year-close-v1.4
+
+
+4. FIRST SAFE CHECK IN THE APP
+------------------------------
+
+Open Accounts > Tax Year Close.
+
+- Select 2025/26.
+- Read the close checks.
+- Correct real problems through Transactions, Expenses, Mileage or Bank Statements.
+- Do not close the tax year until all bank statements and records are present and the figures have been checked.
+- Warnings can be acknowledged, but blocking checks must be fixed first.
+
+Closing the year creates the ZIP in:
+/mnt/nextcloud/accounts-2026-saved-data/tax_year_packs/<tax-year>/
+
+It also makes the ZIP downloadable from the Tax Year Close page.
+
+
+5. IMPORTANT
+------------
+
+- Closing does not email anybody.
+- Closing does not contact the Booking app or HMRC.
+- Booking invoice synchronisation remains enabled exactly as configured in your YAML.
+- If a closed year needs a correction, use Reopen with reason. The previous pack is kept for the audit trail.
+

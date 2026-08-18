@@ -18,7 +18,7 @@ const navItems = [
   { path: "/mileage", label: "Mileage", icon: Car },
   { path: "/bank-statements", label: "Bank Statements", icon: Building2 },
   { path: "/transactions", label: "Transactions", icon: ArrowLeftRight },
-  { path: "/tax-prep", label: "Tax Return", icon: Calculator },
+  { path: "/tax-prep", label: "Tax Year Close", icon: Calculator },
 ];
 
 export const Layout = ({ user, onSignOut }) => {

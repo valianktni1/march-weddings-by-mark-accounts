@@ -8,7 +8,8 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { ArrowLeftRight, TrendingUp, TrendingDown, Ban, Building2, Search, ArrowUpDown, Receipt } from "lucide-react";
+import { ArrowLeftRight, TrendingUp, TrendingDown, Ban, Building2, Search, Receipt, Pencil, Trash2 } from "lucide-react";
+import { Checkbox } from "@/components/ui/checkbox";
 import { formatCurrency, formatDateUK, getCurrentTaxYear } from "@/utils/formatters";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
@@ -49,8 +50,13 @@ export const Transactions = () => {
   const [quickExpense, setQuickExpense] = useState(null);
   const [quickCategory, setQuickCategory] = useState("");
   const [quickSupplier, setQuickSupplier] = useState("");
+  const [editTransaction, setEditTransaction] = useState(null);
+  const [editType, setEditType] = useState("expense");
+  const [editCategory, setEditCategory] = useState("");
+  const [editExcluded, setEditExcluded] = useState(false);
+  const [deleteTransaction, setDeleteTransaction] = useState(null);
 
-  const EXPENSE_CATEGORIES = ["Equipment & Gear", "Software & Subscriptions", "Travel & Transport", "Insurance", "Marketing & Advertising", "Utilities", "Office Supplies", "Professional Services", "Meals", "Other"];
+  const EXPENSE_CATEGORIES = ["Travel & Mileage", "Equipment & Gear", "Software & Subscriptions", "Professional Services", "Marketing & Advertising", "Office & Supplies", "Insurance", "Training & Development", "Venue & Location Fees", "Utilities", "Bank Fees", "Other"];
 
   const fetchTransactions = useCallback(async () => {
     setLoading(true);
@@ -80,6 +86,41 @@ export const Transactions = () => {
       setQuickSupplier("");
       fetchTransactions();
     } catch { toast.error("Failed to create expense"); }
+  };
+
+  const openEdit = (transaction) => {
+    setEditTransaction(transaction);
+    setEditType(transaction.transaction_type || "expense");
+    setEditCategory(transaction.category || "");
+    setEditExcluded(Boolean(transaction.excluded_from_totals));
+  };
+
+  const saveTransaction = async () => {
+    if (!editTransaction) return;
+    try {
+      await axios.put(`${API}/transactions/${editTransaction.id}`, {
+        transaction_type: editType,
+        category: editCategory || null,
+        excluded_from_totals: editExcluded,
+      });
+      toast.success("Transaction updated");
+      setEditTransaction(null);
+      fetchTransactions();
+    } catch (error) {
+      toast.error(error?.response?.data?.detail || "Transaction could not be updated");
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTransaction) return;
+    try {
+      await axios.delete(`${API}/transactions/${deleteTransaction.id}`);
+      toast.success("Duplicate transaction removed");
+      setDeleteTransaction(null);
+      fetchTransactions();
+    } catch (error) {
+      toast.error(error?.response?.data?.detail || "Transaction could not be deleted");
+    }
   };
 
   // Filter transactions by type and search query, then sort
@@ -251,19 +292,20 @@ export const Transactions = () => {
                 <TableHead className="text-stone-500">Type</TableHead>
                 <TableHead className="text-stone-500">Tax Year</TableHead>
                 <TableHead className="text-right text-stone-500">Amount</TableHead>
-                <TableHead className="w-10"></TableHead>
+                <TableHead className="text-stone-500">Category</TableHead>
+                <TableHead className="w-24"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center py-8 text-stone-400">
+                  <TableCell colSpan={7} className="text-center py-8 text-stone-400">
                     Loading...
                   </TableCell>
                 </TableRow>
               ) : filteredTransactions.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center py-8 text-stone-400">
+                  <TableCell colSpan={7} className="text-center py-8 text-stone-400">
                     <div className="flex flex-col items-center gap-2">
                       <ArrowLeftRight className="w-8 h-8 text-stone-300" />
                       <p>No transactions found.</p>
@@ -303,12 +345,13 @@ export const Transactions = () => {
                       <TableCell className={`text-right font-mono font-medium ${typeInfo.color}`}>
                         {tx.transaction_type === "income" ? "+" : "-"}{formatCurrency(tx.amount)}
                       </TableCell>
-                      <TableCell className="w-10">
-                        {tx.transaction_type === "expense" && !tx.excluded_from_totals && !tx.category && (
-                          <Button variant="ghost" size="icon" className="h-7 w-7 text-stone-400 hover:text-[#C7A76D]" title="Create as expense" onClick={() => { setQuickExpense(tx); setQuickCategory(""); setQuickSupplier(""); }} data-testid={"quick-expense-" + tx.id}>
-                            <Receipt className="w-3.5 h-3.5" />
-                          </Button>
-                        )}
+                      <TableCell className="text-xs text-stone-500">{tx.category || (tx.transaction_type === "expense" && !tx.excluded_from_totals ? <span className="font-semibold text-amber-700">Needs category</span> : "—")}</TableCell>
+                      <TableCell className="w-24">
+                        <div className="flex justify-end gap-1">
+                          {tx.transaction_type === "expense" && !tx.excluded_from_totals && !tx.category && <Button variant="ghost" size="icon" className="h-7 w-7 text-stone-400 hover:text-[#C7A76D]" title="Attach receipt details" onClick={() => { setQuickExpense(tx); setQuickCategory(""); setQuickSupplier(""); }} data-testid={"quick-expense-" + tx.id}><Receipt className="w-3.5 h-3.5" /></Button>}
+                          <Button variant="ghost" size="icon" className="h-7 w-7 text-stone-400 hover:text-[#C7A76D]" title="Edit classification" onClick={() => openEdit(tx)}><Pencil className="h-3.5 w-3.5" /></Button>
+                          <Button variant="ghost" size="icon" className="h-7 w-7 text-stone-400 hover:text-rose-700" title="Delete duplicate" onClick={() => setDeleteTransaction(tx)}><Trash2 className="h-3.5 w-3.5" /></Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   );
@@ -345,6 +388,28 @@ export const Transactions = () => {
               </Button>
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!editTransaction} onOpenChange={(open) => { if (!open) setEditTransaction(null); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle>Review transaction</DialogTitle></DialogHeader>
+          {editTransaction && <div className="space-y-4">
+            <div className="rounded-lg bg-stone-50 p-3 text-sm"><p className="font-medium text-stone-800">{editTransaction.description}</p><p className="mt-1 font-mono text-stone-500">{formatCurrency(editTransaction.amount)} · {editTransaction.date}</p></div>
+            <div className="space-y-2"><Label>Classification</Label><Select value={editType} onValueChange={setEditType}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="income">Income</SelectItem><SelectItem value="expense">Business expense</SelectItem><SelectItem value="owner_withdrawal">Owner withdrawal</SelectItem><SelectItem value="tax_payment">HMRC payment</SelectItem></SelectContent></Select></div>
+            {editType === "expense" && !editExcluded && <div className="space-y-2"><Label>Expense category</Label><Select value={editCategory} onValueChange={setEditCategory}><SelectTrigger><SelectValue placeholder="Choose category" /></SelectTrigger><SelectContent>{EXPENSE_CATEGORIES.map((category) => <SelectItem key={category} value={category}>{category}</SelectItem>)}</SelectContent></Select></div>}
+            <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-stone-200 p-3 text-sm"><Checkbox checked={editExcluded} onCheckedChange={(value) => setEditExcluded(value === true)} className="mt-0.5" /><span><strong className="block text-stone-800">Exclude from tax totals</strong><span className="text-stone-500">Use for transfers, personal withdrawals or anything that is not business income or an allowable expense.</span></span></label>
+            <Button onClick={saveTransaction} disabled={editType === "expense" && !editExcluded && !editCategory} className="w-full bg-[#C7A76D] text-white hover:bg-[#B8985E]">Save classification</Button>
+          </div>}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!deleteTransaction} onOpenChange={(open) => { if (!open) setDeleteTransaction(null); }}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader><DialogTitle>Delete this transaction?</DialogTitle></DialogHeader>
+          <p className="text-sm text-stone-600">Only delete it if it is genuinely duplicated or imported by mistake. This cannot be undone.</p>
+          {deleteTransaction && <div className="rounded-lg bg-stone-50 p-3 text-sm"><p className="font-medium">{deleteTransaction.description}</p><p className="mt-1 font-mono text-stone-500">{formatCurrency(deleteTransaction.amount)} · {deleteTransaction.date}</p></div>}
+          <div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setDeleteTransaction(null)}>Keep it</Button><Button className="bg-rose-700 text-white hover:bg-rose-800" onClick={confirmDelete}>Delete transaction</Button></div>
         </DialogContent>
       </Dialog>
     </div>
