@@ -211,6 +211,7 @@ def build_tax_snapshot(
     mileage: list[dict],
     invoices: list[dict],
     bank_statements: list[dict],
+    cash_confirmations: list[dict] | None = None,
     generated_at: str,
 ) -> dict:
     """Build an auditable, cash-basis snapshot without mutating source records."""
@@ -219,6 +220,11 @@ def build_tax_snapshot(
     invalid_records: list[dict] = []
     mismatched_year: list[dict] = []
     negative_records: list[dict] = []
+    active_cash_confirmations = {
+        f"{item.get('source_invoice_id', '')}:{item.get('source_payment_id', '')}": item
+        for item in (cash_confirmations or [])
+        if item.get("active", True)
+    }
 
     def validate(records: list[dict], kind: str) -> None:
         for record in records:
@@ -339,6 +345,7 @@ def build_tax_snapshot(
     manual_invoice_payments: list[dict] = []
     invoice_payment_audit: list[dict] = []
     booking_positive_payments: list[dict] = []
+    booking_cash_payments: list[dict] = []
     for invoice in invoices:
         payment_rows = _payment_rows(invoice, tax_year)
         relevant = bool(payment_rows) or invoice.get("tax_year") == tax_year
@@ -364,14 +371,28 @@ def build_tax_snapshot(
                 continue
             match_row = {
                 "id": f"{invoice.get('id', '')}:{payment.get('id', '')}",
+                "source_invoice_id": str(invoice.get("id") or ""),
+                "source_payment_id": str(payment.get("id") or ""),
                 "date": payment.get("date", ""),
                 "description": audit_row["client"],
                 "amount": money(payment.get("amount")),
                 "reference": payment.get("reference", ""),
                 "invoice_number": audit_row["invoice_number"],
+                "payment_type": audit_row["payment_type"],
             }
             if invoice.get("source_system") == "booking_system":
-                booking_positive_payments.append(match_row)
+                confirmation = active_cash_confirmations.get(match_row["id"])
+                is_cash = str(audit_row["payment_type"] or "").lower() == "cash" or bool(confirmation)
+                if is_cash:
+                    booking_cash_payments.append({
+                        **match_row,
+                        "confirmation_id": str((confirmation or {}).get("id") or ""),
+                        "confirmation_reason": str((confirmation or {}).get("reason") or "Recorded as cash in the Booking system"),
+                        "confirmed_by": str((confirmation or {}).get("confirmed_by") or "Booking system"),
+                        "confirmed_at": str((confirmation or {}).get("created_at") or ""),
+                    })
+                else:
+                    booking_positive_payments.append(match_row)
             elif invoice.get("include_in_totals"):
                 manual_invoice_payments.append(match_row)
 
@@ -392,6 +413,38 @@ def build_tax_snapshot(
     matched_booking, unmatched_booking = _match_cash_items(booking_positive_payments, [row for row in income_ledger if row.get("source") == "bank"])
     if unmatched_booking:
         checks.append(_issue("unmatched_booking_payments", "warning", "Booking payments not matched to an imported bank receipt", unmatched_booking, "Check that every relevant bank statement has been imported; timing and combined payments can also cause unmatched items."))
+
+    # Cash handed over in person is genuine income even though no bank receipt
+    # exists. It is included exactly once after either being recorded as Cash
+    # in Booking or explicitly confirmed in Accounts.
+    for row in booking_cash_payments:
+        income_ledger.append({
+            **row,
+            "category": "Other business income",
+            "transaction_type": "income",
+            "included": True,
+            "source": "booking cash",
+            "income_source": "confirmed cash receipt",
+            "description": f"{row.get('invoice_number', '')} - {row.get('description', '')}".strip(" -"),
+        })
+
+    possible_cash_bank_duplicates = []
+    bank_income_rows = [row for row in income_ledger if row.get("source") == "bank" and row.get("included")]
+    for cash_row in booking_cash_payments:
+        if any(
+            money(bank_row.get("amount")) == money(cash_row.get("amount"))
+            and iso_date(bank_row.get("date")) == iso_date(cash_row.get("date"))
+            for bank_row in bank_income_rows
+        ):
+            possible_cash_bank_duplicates.append(cash_row)
+    if possible_cash_bank_duplicates:
+        checks.append(_issue(
+            "cash_bank_duplicates",
+            "blocker",
+            "Cash receipts may also be present in the bank ledger",
+            possible_cash_bank_duplicates,
+            "If the cash was paid into the bank, exclude that bank deposit from totals; otherwise undo the cash confirmation.",
+        ))
 
     pending_statements = [
         {
@@ -493,11 +546,13 @@ def build_tax_snapshot(
         "mileage_ledger": mileage,
         "invoice_payment_audit": invoice_payment_audit,
         "booking_reconciliation": {
-            "booking_payments": len(booking_positive_payments),
+            "booking_payments": len(booking_positive_payments) + len(booking_cash_payments),
             "matched": len(matched_booking),
             "unmatched": len(unmatched_booking),
+            "confirmed_cash": len(booking_cash_payments),
             "matched_rows": matched_booking,
             "unmatched_rows": unmatched_booking,
+            "cash_rows": booking_cash_payments,
         },
         "manual_income_reconciliation": {
             "manual_payments": len(manual_invoice_payments),
@@ -527,6 +582,7 @@ def build_tax_snapshot(
             "mileage_entries": len(mileage),
             "invoices_reviewed": len(invoices),
             "bank_statements": len(bank_statements),
+            "cash_confirmations": len(active_cash_confirmations),
         },
     }
 
@@ -726,11 +782,16 @@ def build_evidence_pack(
             ["Invoice", "Previous reference", "Client", "Status", "Payment date", "Payment amount", "Payment type", "Reference", "Source"],
             ([row.get("invoice_number", ""), row.get("legacy_invoice_number", ""), row.get("client", ""), row.get("status", ""), row.get("payment_date", ""), f"{money(row.get('payment_amount')):.2f}", row.get("payment_type", ""), row.get("reference", ""), row.get("source_system", "")] for row in snapshot["invoice_payment_audit"]),
         ))
-        reconciliation_rows = snapshot["booking_reconciliation"]["matched_rows"] + snapshot["booking_reconciliation"]["unmatched_rows"]
+        reconciliation_rows = (
+            snapshot["booking_reconciliation"]["matched_rows"]
+            + snapshot["booking_reconciliation"]["unmatched_rows"]
+            + snapshot["booking_reconciliation"].get("cash_rows", [])
+        )
         matched_ids = {row.get("id") for row in snapshot["booking_reconciliation"]["matched_rows"]}
+        cash_ids = {row.get("id") for row in snapshot["booking_reconciliation"].get("cash_rows", [])}
         (reports / "booking-bank-reconciliation.csv").write_bytes(_csv_bytes(
-            ["Invoice", "Payment date", "Amount", "Matched", "Bank description"],
-            ([row.get("invoice_number", ""), row.get("date", ""), f"{money(row.get('amount')):.2f}", "Yes" if row.get("id") in matched_ids else "No", row.get("bank_description", "")] for row in reconciliation_rows),
+            ["Invoice", "Payment date", "Amount", "Treatment", "Bank description", "Cash confirmation reason"],
+            ([row.get("invoice_number", ""), row.get("date", ""), f"{money(row.get('amount')):.2f}", "Matched to bank" if row.get("id") in matched_ids else ("Cash received" if row.get("id") in cash_ids else "Unmatched"), row.get("bank_description", ""), row.get("confirmation_reason", "")] for row in reconciliation_rows),
         ))
         (reports / "receipt-index.csv").write_bytes(_csv_bytes(
             ["Date", "Description", "Supplier", "Amount", "Included", "Evidence file"],

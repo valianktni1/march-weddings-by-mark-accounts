@@ -50,7 +50,8 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.18-tax-year-close-v1.4"
+BUILD_ID = "2026.08.18-cancelled-invoice-stamp-v1.4.2"
+INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
 # API routes are not advertised publicly.
@@ -305,6 +306,13 @@ class TaxYearReopenRequest(BaseModel):
     reason: str = Field(min_length=5, max_length=2000)
 
 
+class CashPaymentAction(BaseModel):
+    source_invoice_id: str = Field(min_length=1, max_length=160)
+    source_payment_id: str = Field(min_length=1, max_length=160)
+    confirmation: str = Field(min_length=1, max_length=40)
+    reason: str = Field(min_length=5, max_length=1000)
+
+
 class TransactionUpdate(BaseModel):
     transaction_type: str = Field(pattern="^(income|expense|owner_withdrawal|tax_payment)$")
     category: Optional[str] = Field(default=None, max_length=160)
@@ -489,6 +497,23 @@ async def _record_invoice_audit(
     })
 
 
+def _is_cancelled_wedding_invoice(invoice: dict) -> bool:
+    status_text = str(invoice.get("status") or "").strip().lower()
+    cancellation_evidence = " ".join(str(invoice.get(key) or "") for key in (
+        "cancellation_reason", "void_reason", "notes",
+    )).lower()
+    return (
+        status_text == "cancelled"
+        or bool(invoice.get("cancellation_date") or invoice.get("cancellation_reason"))
+        or "wedding cancelled" in cancellation_evidence
+        or "wedding canceled" in cancellation_evidence
+        or "job was cancelled" in cancellation_evidence
+        or "job was canceled" in cancellation_evidence
+        or "source job was cancelled" in cancellation_evidence
+        or "source job was canceled" in cancellation_evidence
+    )
+
+
 def _regenerate_invoice_pdf(invoice: dict) -> dict:
     inv_num = str(invoice.get("invoice_number") or "invoice")
     safe_number = re.sub(r"[^A-Za-z0-9_.-]", "_", inv_num)
@@ -498,6 +523,19 @@ def _regenerate_invoice_pdf(invoice: dict) -> dict:
     generate_invoice_pdf(invoice, str(pdf_path))
     invoice["file_path"] = str(pdf_path)
     invoice["file_name"] = f"{safe_number}.pdf"
+    invoice["pdf_format_version"] = INVOICE_PDF_FORMAT_VERSION
+    return invoice
+
+
+async def _ensure_invoice_pdf_current(invoice: dict) -> dict:
+    if int(invoice.get("pdf_format_version") or 0) >= INVOICE_PDF_FORMAT_VERSION:
+        return invoice
+    _regenerate_invoice_pdf(invoice)
+    await db.invoices.update_one({"id": invoice.get("id")}, {"$set": {
+        "file_path": invoice.get("file_path"),
+        "file_name": invoice.get("file_name"),
+        "pdf_format_version": INVOICE_PDF_FORMAT_VERSION,
+    }})
     return invoice
 
 
@@ -909,6 +947,9 @@ async def _tax_close_snapshot(tax_year: str) -> dict:
     mileage_entries = await db.mileage.find({"tax_year": tax_year}, {"_id": 0}).to_list(100000)
     invoices = await db.invoices.find({}, {"_id": 0}).to_list(100000)
     bank_statements = await db.bank_statements.find({}, {"_id": 0}).to_list(10000)
+    cash_confirmations = await db.cash_payment_confirmations.find(
+        {"tax_year": tax_year, "active": True}, {"_id": 0}
+    ).to_list(100000)
     return build_tax_snapshot(
         tax_year=tax_year,
         business_name=str(settings.get("business_name") or "Weddings by Mark"),
@@ -917,6 +958,7 @@ async def _tax_close_snapshot(tax_year: str) -> dict:
         mileage=mileage_entries,
         invoices=invoices,
         bank_statements=bank_statements,
+        cash_confirmations=cash_confirmations,
         generated_at=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -1013,6 +1055,7 @@ async def _tax_pack_evidence(snapshot: dict) -> list[dict]:
     invoice_ids = {row.get("invoice_id") for row in snapshot.get("invoice_payment_audit", []) if row.get("invoice_id")}
     invoices = await db.invoices.find({"id": {"$in": list(invoice_ids)}}, {"_id": 0}).to_list(100000) if invoice_ids else []
     for record in invoices:
+        record = await _ensure_invoice_pdf_current(record)
         source = _safe_evidence_source(record.get("file_path"))
         if source:
             evidence.append({
@@ -1034,7 +1077,6 @@ async def get_tax_year_close(tax_year: str):
     }
     if isinstance(public_snapshot.get("booking_reconciliation"), dict):
         public_snapshot["booking_reconciliation"].pop("matched_rows", None)
-        public_snapshot["booking_reconciliation"].pop("unmatched_rows", None)
     return {"close": _public_tax_year_close_state(close_state), "review": public_snapshot}
 
 
@@ -1047,6 +1089,88 @@ async def get_tax_year_close_history(tax_year: str):
     return await db.tax_year_close_audit.find(
         {"tax_year": tax_year}, {"_id": 0}
     ).sort("created_at", -1).to_list(1000)
+
+
+def _booking_payment_from_invoice(invoice: dict, source_payment_id: str) -> Optional[dict]:
+    return next(
+        (item for item in invoice.get("payments") or [] if str(item.get("id") or "") == source_payment_id),
+        None,
+    )
+
+
+@api_router.post("/tax-year-close/{tax_year}/cash-payments/confirm")
+async def confirm_booking_cash_payment(tax_year: str, payload: CashPaymentAction, request: Request):
+    if payload.confirmation.strip() != "CONFIRM CASH":
+        raise HTTPException(status_code=422, detail='Type "CONFIRM CASH" exactly')
+    await _assert_tax_year_open(tax_year)
+    invoice = await db.invoices.find_one({
+        "id": payload.source_invoice_id,
+        "source_system": "booking_system",
+    }, {"_id": 0})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Linked Booking invoice not found")
+    payment = _booking_payment_from_invoice(invoice, payload.source_payment_id)
+    if not payment or float(payment.get("amount") or 0) <= 0:
+        raise HTTPException(status_code=404, detail="Positive Booking payment not found")
+    payment_year = calc_tax_year_from_date(format_date_uk(payment.get("paid_date")))
+    if payment_year != tax_year:
+        raise HTTPException(status_code=409, detail=f"This payment belongs to tax year {payment_year}")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    admin_email = _admin_from_request(request)
+    key = {
+        "tax_year": tax_year,
+        "source_invoice_id": payload.source_invoice_id,
+        "source_payment_id": payload.source_payment_id,
+    }
+    existing = await db.cash_payment_confirmations.find_one(key, {"_id": 0})
+    confirmation_id = (existing or {}).get("id") or str(uuid.uuid4())
+    record = {
+        **key,
+        "id": confirmation_id,
+        "invoice_number": invoice.get("invoice_number"),
+        "client": invoice.get("couple_names") or invoice.get("client_name") or "",
+        "amount": round(float(payment.get("amount") or 0), 2),
+        "paid_date": payment.get("paid_date"),
+        "reason": payload.reason.strip(),
+        "confirmed_by": admin_email,
+        "created_at": now_iso,
+        "active": True,
+    }
+    await db.cash_payment_confirmations.update_one(key, {"$set": record}, upsert=True)
+    await db.cash_payment_audit.insert_one({
+        "id": str(uuid.uuid4()), **key, "action": "confirmed_cash",
+        "reason": payload.reason.strip(), "admin_email": admin_email, "created_at": now_iso,
+    })
+    return record
+
+
+@api_router.post("/tax-year-close/{tax_year}/cash-payments/revoke")
+async def revoke_booking_cash_payment(tax_year: str, payload: CashPaymentAction, request: Request):
+    if payload.confirmation.strip() != "REMOVE CASH":
+        raise HTTPException(status_code=422, detail='Type "REMOVE CASH" exactly')
+    await _assert_tax_year_open(tax_year)
+    key = {
+        "tax_year": tax_year,
+        "source_invoice_id": payload.source_invoice_id,
+        "source_payment_id": payload.source_payment_id,
+    }
+    existing = await db.cash_payment_confirmations.find_one({**key, "active": True}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Active cash confirmation not found")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    admin_email = _admin_from_request(request)
+    await db.cash_payment_confirmations.update_one(key, {"$set": {
+        "active": False,
+        "revoked_at": now_iso,
+        "revoked_by": admin_email,
+        "revocation_reason": payload.reason.strip(),
+    }})
+    await db.cash_payment_audit.insert_one({
+        "id": str(uuid.uuid4()), **key, "action": "cash_confirmation_removed",
+        "reason": payload.reason.strip(), "admin_email": admin_email, "created_at": now_iso,
+    })
+    return {"status": "removed", **key}
 
 
 @api_router.post("/tax-year-close/{tax_year}/close")
@@ -1363,18 +1487,54 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
     right_style = ParagraphStyle("Right", parent=styles["Normal"], fontSize=9, textColor=dark, alignment=TA_RIGHT)
     center_style = ParagraphStyle("Center", parent=styles["Normal"], fontSize=9, textColor=dark, alignment=TA_CENTER)
 
+    def public_invoice_text(value: Any, fallback: str = "") -> str:
+        text = str(value or "").strip()
+        return fallback if re.search(r"studio\s*ninja", text, flags=re.IGNORECASE) else text
+
+    status_text = str(invoice_data.get("status") or "").strip().lower()
+    wedding_cancelled = _is_cancelled_wedding_invoice(invoice_data)
+    closed_status = wedding_cancelled or status_text == "void"
+
     # Logo
     logo_path = Path(__file__).parent / "logo.png"
     if logo_path.exists():
-        logo = Image(str(logo_path), width=60*mm, height=60*mm)
+        logo_size = 44*mm if wedding_cancelled else 60*mm
+        logo = Image(str(logo_path), width=logo_size, height=logo_size)
         logo.hAlign = "LEFT"
         elements.append(logo)
-        elements.append(Spacer(1, 4*mm))
+        elements.append(Spacer(1, 1*mm if wedding_cancelled else 4*mm))
     else:
         title_style = ParagraphStyle("Title", parent=styles["Title"], fontSize=22, textColor=brand_color, spaceAfter=2)
         subtitle_style = ParagraphStyle("Subtitle", parent=styles["Normal"], fontSize=9, textColor=grey, spaceAfter=12)
         elements.append(Paragraph("Weddings By Mark", title_style))
         elements.append(Paragraph("Professional Wedding Photographers", subtitle_style))
+
+    if wedding_cancelled:
+        retained_amount = float(invoice_data.get("amount_retained") or 0)
+        if not retained_amount:
+            retained_amount = max(0.0, float(invoice_data.get("gross_received") or 0) - float(invoice_data.get("total_refunded") or 0))
+        banner_title = ParagraphStyle(
+            "CancelledBannerTitle", parent=styles["Normal"], fontName="Helvetica-Bold",
+            fontSize=20, leading=23, textColor=colors.HexColor("#991b1b"), alignment=TA_CENTER,
+        )
+        banner_detail = ParagraphStyle(
+            "CancelledBannerDetail", parent=styles["Normal"], fontName="Helvetica-Bold",
+            fontSize=10, leading=14, textColor=colors.HexColor("#7f1d1d"), alignment=TA_CENTER,
+        )
+        cancellation_banner = Table([
+            [Paragraph("CANCELLED WEDDING", banner_title)],
+            [Paragraph(f"PAYMENT RETAINED: £{retained_amount:,.2f} &nbsp;&nbsp;•&nbsp;&nbsp; NO FURTHER PAYMENT DUE", banner_detail)],
+        ], colWidths=[170*mm])
+        cancellation_banner.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fef2f2")),
+            ("BOX", (0, 0), (-1, -1), 2, colors.HexColor("#b91c1c")),
+            ("TOPPADDING", (0, 0), (-1, 0), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+            ("TOPPADDING", (0, 1), (-1, 1), 3),
+            ("BOTTOMPADDING", (0, 1), (-1, 1), 9),
+        ]))
+        elements.append(cancellation_banner)
+        elements.append(Spacer(1, 3*mm))
 
     # Invoice info row
     inv_num = invoice_data.get("invoice_number", "")
@@ -1388,14 +1548,14 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
     except:
         pass
 
-    closed_label = "CANCELLED INVOICE" if invoice_data.get("status") == "cancelled" else "VOID INVOICE" if invoice_data.get("status") == "void" else "INVOICE"
+    closed_label = "CANCELLED WEDDING RECORD" if wedding_cancelled else "VOID INVOICE" if status_text == "void" else "INVOICE"
     info_data = [
         [Paragraph(f"<b>{closed_label}:</b> {inv_num}", normal_style), Paragraph(f"<b>Issue Date:</b> {issue_date}", right_style)],
     ]
     info_table = Table(info_data, colWidths=[270, 270])
     info_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
     elements.append(info_table)
-    elements.append(Spacer(1, 6*mm))
+    elements.append(Spacer(1, 3*mm if wedding_cancelled else 6*mm))
 
     # FROM and INVOICE FOR
     from_text = "Weddings By Mark\n07712117357\nmarkpowell121@googlemail.com\nAshurst Road, Manchester\nM22 5AX"
@@ -1421,12 +1581,12 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
     addr_table = Table(addr_data, colWidths=[270, 270])
     addr_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
     elements.append(addr_table)
-    elements.append(Spacer(1, 6*mm))
+    elements.append(Spacer(1, 3*mm if wedding_cancelled else 6*mm))
 
     # Package / Line items
     elements.append(Paragraph("Package Details", heading_style))
     pkg_name = invoice_data.get("package_name") or "Wedding Photography Package"
-    notes = invoice_data.get("notes") or ""
+    notes = public_invoice_text(invoice_data.get("notes"), "")
     total = invoice_data.get("total_price", 0)
 
     line_data = [
@@ -1452,7 +1612,7 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
     total_table = Table(total_data, colWidths=[320, 120, 100])
     total_table.setStyle(TableStyle([("TOPPADDING", (0, 0), (-1, -1), 6)]))
     elements.append(total_table)
-    elements.append(Spacer(1, 8*mm))
+    elements.append(Spacer(1, 4*mm if wedding_cancelled else 8*mm))
 
     # Payment schedule
     elements.append(Paragraph("Payment Schedule", heading_style))
@@ -1477,11 +1637,25 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
         gross = invoice_data.get("gross_received", 0) or 0
         refunded = invoice_data.get("total_refunded", 0) or 0
         retained = invoice_data.get("amount_retained", 0) or 0
-        pay_data.append([Paragraph("Payments received", normal_style), Paragraph(f"£{gross:,.2f}", right_style), Paragraph("Recorded", center_style), Paragraph("See booking system", center_style)])
-        if refunded > 0:
-            pay_data.append([Paragraph("Refunded", normal_style), Paragraph(f"-£{refunded:,.2f}", right_style), Paragraph("Refunded", center_style), Paragraph("See booking system", center_style)])
+        itemised_payments = [row for row in (invoice_data.get("payments") or []) if float(row.get("amount") or 0) != 0]
+        if itemised_payments:
+            for payment in itemised_payments:
+                amount = float(payment.get("amount") or 0)
+                method = str(payment.get("payment_type") or ("refund" if amount < 0 else "payment")).replace("_", " ").title()
+                paid_date = format_date_uk(payment.get("paid_date")) or "Date recorded privately"
+                label = "Refund" if amount < 0 else f"Payment received — {method}"
+                pay_data.append([
+                    Paragraph(label, normal_style),
+                    Paragraph(f"-£{abs(amount):,.2f}" if amount < 0 else f"£{amount:,.2f}", right_style),
+                    Paragraph("Refunded" if amount < 0 else "Recorded", center_style),
+                    Paragraph(paid_date, center_style),
+                ])
+        else:
+            received_date = invoice_data.get("final_payment_paid_date") or invoice_data.get("interim_payment_date") or invoice_data.get("deposit_paid_date") or "Date recorded privately"
+            pay_data.append([Paragraph("Payments received", normal_style), Paragraph(f"£{gross:,.2f}", right_style), Paragraph("Recorded", center_style), Paragraph(str(received_date), center_style)])
+            if refunded > 0:
+                pay_data.append([Paragraph("Refunded", normal_style), Paragraph(f"-£{refunded:,.2f}", right_style), Paragraph("Refunded", center_style), Paragraph("Date recorded privately", center_style)])
         pay_data.append([Paragraph("Payment retained", normal_style), Paragraph(f"£{retained:,.2f}", right_style), Paragraph("Recorded", center_style), Paragraph("-", center_style)])
-        closed_status = invoice_data.get("status") in {"cancelled", "void"}
         pay_data.append([Paragraph("Remaining Balance", normal_style), Paragraph(f"£{balance:,.2f}", right_style), Paragraph("Closed" if closed_status else ("Paid" if balance <= 0 else "Unpaid"), center_style), Paragraph("-" if closed_status or balance <= 0 else f"Due: {final_due}", center_style)])
     else:
         pay_data.append([Paragraph("Deposit", normal_style), Paragraph(f"£{deposit:,.2f}", right_style), Paragraph(dep_status, center_style), Paragraph(dep_date, center_style)])
@@ -1501,16 +1675,24 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
     ]))
     elements.append(pay_table)
 
-    if linked and invoice_data.get("status") == "cancelled":
-        cancellation_text = invoice_data.get("cancellation_reason") or "Booking cancelled"
+    if linked and wedding_cancelled:
+        cancellation_text = public_invoice_text(
+            invoice_data.get("cancellation_reason") or invoice_data.get("void_reason"),
+            "Wedding cancelled by the client. The payment shown was retained.",
+        )
         cancellation_date = invoice_data.get("cancellation_date") or "Not recorded"
         elements.append(Spacer(1, 4*mm))
-        elements.append(Paragraph(f"<b>Cancellation recorded {cancellation_date}.</b> {cancellation_text}<br/>No further payment is due.", small_style))
+        cancellation_heading = (
+            f"Wedding cancellation recorded {cancellation_date}."
+            if cancellation_date != "Not recorded"
+            else "Wedding cancellation recorded."
+        )
+        elements.append(Paragraph(f"<b>{cancellation_heading}</b> {cancellation_text}<br/><b>This cancelled invoice and its retained payment remain preserved for the financial record. No further payment is due.</b>", small_style))
 
-    if invoice_data.get("status") == "void":
-        void_text = invoice_data.get("void_reason") or "Invoice voided in Accounts"
+    if status_text == "void" and not wedding_cancelled:
+        void_text = public_invoice_text(invoice_data.get("void_reason"), "Invoice voided; the original number remains preserved for the financial record.")
         elements.append(Spacer(1, 4*mm))
-        elements.append(Paragraph(f"<b>Invoice voided.</b> {void_text}<br/>No further payment is due on this Accounts copy.", small_style))
+        elements.append(Paragraph(f"<b>Invoice voided.</b> {void_text}<br/>No further payment is due.", small_style))
 
     # Balance due
     if balance > 0 and bal_status == "Unpaid":
@@ -1520,12 +1702,30 @@ def generate_invoice_pdf(invoice_data: dict, output_path: str):
         elements.append(bal_table)
 
     # Footer
-    elements.append(Spacer(1, 10*mm))
-    elements.append(Paragraph("Pay by Bank Transfer", ParagraphStyle("ft", parent=normal_style, fontName="Helvetica-Bold", textColor=brand_color)))
-    elements.append(Spacer(1, 4*mm))
-    elements.append(Paragraph("Thank you for choosing Weddings By Mark as your Photographer for the big day.", small_style))
+    elements.append(Spacer(1, 4*mm if closed_status else 10*mm))
+    if closed_status:
+        elements.append(Paragraph("CLOSED FINANCIAL RECORD — NO PAYMENT REQUESTED", ParagraphStyle("ft-closed", parent=normal_style, fontName="Helvetica-Bold", textColor=colors.HexColor("#991b1b"))))
+    else:
+        elements.append(Paragraph("Pay by Bank Transfer", ParagraphStyle("ft", parent=normal_style, fontName="Helvetica-Bold", textColor=brand_color)))
+        elements.append(Spacer(1, 4*mm))
+        elements.append(Paragraph("Thank you for choosing Weddings By Mark as your Photographer for the big day.", small_style))
 
-    doc.build(elements)
+    def draw_status_watermark(canvas, _doc):
+        if not wedding_cancelled:
+            return
+        canvas.saveState()
+        try:
+            canvas.setFillAlpha(0.08)
+        except Exception:
+            pass
+        canvas.setFillColor(colors.HexColor("#b91c1c"))
+        canvas.translate(A4[0] / 2, A4[1] / 2)
+        canvas.rotate(32)
+        canvas.setFont("Helvetica-Bold", 38)
+        canvas.drawCentredString(0, 0, "CANCELLED WEDDING")
+        canvas.restoreState()
+
+    doc.build(elements, onFirstPage=draw_status_watermark, onLaterPages=draw_status_watermark)
 
 
 def calc_final_payment_due(wedding_date_str):
@@ -1917,6 +2117,7 @@ async def get_invoice_pdf(invoice_id: str):
     invoice = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    invoice = await _ensure_invoice_pdf_current(invoice)
     file_path = invoice.get("file_path")
     if not file_path or not Path(file_path).exists():
         raise HTTPException(status_code=404, detail="PDF not found")
@@ -2210,6 +2411,7 @@ async def _sync_booking_invoice(payload: BookingInvoiceSync):
     generate_invoice_pdf(invoice_data, str(pdf_path))
     invoice_data["file_path"] = str(pdf_path)
     invoice_data["file_name"] = f"{safe_number}.pdf"
+    invoice_data["pdf_format_version"] = INVOICE_PDF_FORMAT_VERSION
     old_pdf_path = existing.get("file_path") if existing else None
 
     await db.invoices.update_one(
@@ -3185,6 +3387,8 @@ BACKUP_COLLECTIONS = [
     "invoice_audit_logs",
     "tax_year_closes",
     "tax_year_close_audit",
+    "cash_payment_confirmations",
+    "cash_payment_audit",
 ]
 BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
 
@@ -3424,6 +3628,15 @@ async def startup_checks():
     await db.tax_year_close_audit.create_index(
         [("tax_year", 1), ("created_at", -1)],
         name="tax_year_close_history",
+    )
+    await db.cash_payment_confirmations.create_index(
+        [("tax_year", 1), ("source_invoice_id", 1), ("source_payment_id", 1)],
+        unique=True,
+        name="unique_cash_payment_confirmation",
+    )
+    await db.cash_payment_audit.create_index(
+        [("tax_year", 1), ("created_at", -1)],
+        name="cash_payment_audit_history",
     )
 
 

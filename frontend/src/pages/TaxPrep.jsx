@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import axios from "axios";
 import { toast } from "sonner";
 import {
-  AlertCircle, Archive, CheckCircle2, Download, FileCheck2, LockKeyhole,
+  AlertCircle, Archive, Banknote, CheckCircle2, Download, FileCheck2, LockKeyhole,
   PoundSterling, RefreshCw, RotateCcw, ShieldCheck, TrendingDown,
   TrendingUp, TriangleAlert,
 } from "lucide-react";
@@ -46,6 +46,11 @@ export default function TaxPrep() {
   const [reason, setReason] = useState("");
   const [confirmation, setConfirmation] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
+  const [cashOpen, setCashOpen] = useState(false);
+  const [cashMode, setCashMode] = useState("confirm");
+  const [cashPayment, setCashPayment] = useState(null);
+  const [cashReason, setCashReason] = useState("");
+  const [cashConfirmation, setCashConfirmation] = useState("");
 
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -100,6 +105,24 @@ export default function TaxPrep() {
       anchor.click(); URL.revokeObjectURL(url); toast.success("Evidence pack downloaded");
     } catch (error) { toast.error(errorText(error, "Evidence pack could not be downloaded")); }
   };
+  const openCashAction = (payment, mode) => {
+    setCashPayment(payment); setCashMode(mode); setCashReason(""); setCashConfirmation(""); setCashOpen(true);
+  };
+  const saveCashAction = async () => {
+    const endpoint = cashMode === "confirm" ? "confirm" : "revoke";
+    setWorking(true);
+    try {
+      await axios.post(`${API}/tax-year-close/${taxYear}/cash-payments/${endpoint}`, {
+        source_invoice_id: cashPayment.source_invoice_id,
+        source_payment_id: cashPayment.source_payment_id,
+        reason: cashReason,
+        confirmation: cashConfirmation,
+      });
+      toast.success(cashMode === "confirm" ? "Cash payment included once as income" : "Cash confirmation removed");
+      setCashOpen(false); await load(true);
+    } catch (error) { toast.error(errorText(error, "Cash payment could not be updated")); }
+    finally { setWorking(false); }
+  };
 
   if (loading || !data) return <div className="flex min-h-[50vh] items-center justify-center text-stone-500"><RefreshCw className="mr-2 h-5 w-5 animate-spin" />Checking the tax year…</div>;
 
@@ -109,6 +132,9 @@ export default function TaxPrep() {
   const validation = review.validation;
   const isClosed = close.status === "closed";
   const canClose = validation.ready_to_close && (!validation.warning_count || acknowledged);
+  const reconciliation = review.booking_reconciliation || {};
+  const unmatchedPayments = reconciliation.unmatched_rows || [];
+  const cashPayments = reconciliation.cash_rows || [];
 
   return (
     <div className="space-y-6 animate-fade-in" data-testid="tax-year-close-page">
@@ -157,6 +183,14 @@ export default function TaxPrep() {
         </CardContent>
       </Card>
 
+      <Card className="border-stone-200">
+        <CardHeader className="border-b border-stone-100 pb-4"><div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><div><CardTitle className="flex items-center gap-2 text-lg"><Banknote className="h-5 w-5 text-[#C7A76D]" />Booking payment reconciliation</CardTitle><p className="mt-1 text-sm text-stone-500">Bank transfers are matched to your statements. Genuine cash can be confirmed without creating a fake bank transaction.</p></div><div className="flex gap-2"><Badge className="bg-emerald-100 text-emerald-800">{reconciliation.matched || 0} bank matched</Badge><Badge className="bg-sky-100 text-sky-800">{reconciliation.confirmed_cash || 0} cash</Badge><Badge className="bg-amber-100 text-amber-800">{reconciliation.unmatched || 0} unmatched</Badge></div></div></CardHeader>
+        <CardContent className="p-0">
+          {cashPayments.length > 0 && <div className="border-b border-stone-100 p-4 sm:p-5"><p className="mb-3 text-sm font-semibold text-stone-800">Confirmed cash income</p><div className="max-h-72 space-y-2 overflow-y-auto">{cashPayments.map((payment) => <div key={payment.id} className="flex flex-col gap-3 rounded-lg border border-sky-100 bg-sky-50 p-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium text-stone-900">{payment.invoice_number} · {payment.description}</p><p className="text-sm text-stone-600">{payment.date} · {money(payment.amount)} · Cash received</p><p className="mt-1 text-xs text-stone-500">{payment.confirmation_reason}</p></div>{!isClosed && payment.confirmation_id && <Button size="sm" variant="outline" onClick={() => openCashAction(payment, "revoke")}>Undo cash confirmation</Button>}</div>)}</div></div>}
+          {unmatchedPayments.length > 0 ? <div className="p-4 sm:p-5"><p className="mb-3 text-sm font-semibold text-stone-800">Payments needing a decision</p><div className="max-h-96 space-y-2 overflow-y-auto">{unmatchedPayments.map((payment) => <div key={payment.id} className="flex flex-col gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="font-medium text-stone-900">{payment.invoice_number} · {payment.description}</p><p className="text-sm text-stone-600">{payment.date} · {money(payment.amount)} · no bank match</p></div><Button size="sm" disabled={isClosed} className="bg-[#C7A76D] text-white hover:bg-[#B8985E]" onClick={() => openCashAction(payment, "confirm")}>Confirm cash received</Button></div>)}</div></div> : cashPayments.length === 0 && <div className="flex items-center gap-3 p-6 text-emerald-800"><CheckCircle2 className="h-5 w-5" /><span className="font-medium">Every Booking payment is reconciled.</span></div>}
+        </CardContent>
+      </Card>
+
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-5">
         <Card className="border-stone-200 xl:col-span-3"><CardHeader><CardTitle className="text-lg">Quarterly view</CardTitle></CardHeader><CardContent className="overflow-x-auto p-0 sm:px-6 sm:pb-6"><Table className="min-w-[620px]"><TableHeader><TableRow><TableHead>Quarter</TableHead><TableHead>Period</TableHead><TableHead className="text-right">Income</TableHead><TableHead className="text-right">Expenses</TableHead><TableHead className="text-right">Profit</TableHead></TableRow></TableHeader><TableBody>{review.quarters.map((quarter) => <TableRow key={quarter.name}><TableCell className="font-semibold">{quarter.name}</TableCell><TableCell className="text-stone-500">{quarter.label}</TableCell><TableCell className="text-right font-mono">{money(quarter.income)}</TableCell><TableCell className="text-right font-mono">{money(quarter.expenses)}</TableCell><TableCell className="text-right font-mono font-medium">{money(quarter.profit)}</TableCell></TableRow>)}</TableBody></Table></CardContent></Card>
         <Card className="border-stone-200 xl:col-span-2"><CardHeader><CardTitle className="text-lg">Expense categories</CardTitle></CardHeader><CardContent className="space-y-3">{review.category_summary.length ? review.category_summary.map((item) => <div key={item.category} className="flex items-center justify-between gap-4 border-b border-stone-100 pb-2 text-sm"><span className="text-stone-600">{item.category}</span><span className="font-mono font-medium">{money(item.amount)}</span></div>) : <p className="text-sm text-stone-500">No included expenses in this tax year.</p>}</CardContent></Card>
@@ -178,6 +212,12 @@ export default function TaxPrep() {
         <div className="space-y-2"><Label htmlFor="reopen-reason">Why is it being reopened?</Label><Textarea id="reopen-reason" value={reason} onChange={(event) => setReason(event.target.value)} placeholder="For example: Correcting a duplicated bank transaction" /></div>
         <div className="space-y-2"><Label htmlFor="reopen-confirmation">Type REOPEN {taxYear}</Label><Input id="reopen-confirmation" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></div>
       </div><DialogFooter><Button variant="outline" onClick={() => setReopenOpen(false)}>Keep closed</Button><Button onClick={reopenYear} disabled={working || reason.trim().length < 5 || confirmation !== `REOPEN ${taxYear}`} className="bg-amber-700 text-white hover:bg-amber-800">{working ? "Reopening…" : "Reopen and record reason"}</Button></DialogFooter></DialogContent></Dialog>
+
+      <Dialog open={cashOpen} onOpenChange={setCashOpen}><DialogContent><DialogHeader><DialogTitle>{cashMode === "confirm" ? "Confirm cash received" : "Undo cash confirmation"}</DialogTitle><DialogDescription>{cashPayment ? `${cashPayment.invoice_number} · ${cashPayment.description} · ${money(cashPayment.amount)} received ${cashPayment.date}` : "Booking payment"}</DialogDescription></DialogHeader><div className="space-y-4">
+        <div className="rounded-lg border border-sky-200 bg-sky-50 p-3 text-sm text-sky-900">{cashMode === "confirm" ? "Use this only when the money was genuinely handed to you in cash. It will be counted once as income without a bank match." : "The payment will return to the unmatched list. The correction remains recorded in the audit history."}</div>
+        <div className="space-y-2"><Label htmlFor="cash-reason">Private audit note</Label><Textarea id="cash-reason" value={cashReason} onChange={(event) => setCashReason(event.target.value)} placeholder={cashMode === "confirm" ? "For example: Final balance paid in cash at the wedding" : "Why is the cash confirmation being removed?"} /></div>
+        <div className="space-y-2"><Label htmlFor="cash-confirmation">Type {cashMode === "confirm" ? "CONFIRM CASH" : "REMOVE CASH"}</Label><Input id="cash-confirmation" value={cashConfirmation} onChange={(event) => setCashConfirmation(event.target.value)} autoComplete="off" /></div>
+      </div><DialogFooter><Button variant="outline" onClick={() => setCashOpen(false)}>Cancel</Button><Button onClick={saveCashAction} disabled={working || cashReason.trim().length < 5 || cashConfirmation !== (cashMode === "confirm" ? "CONFIRM CASH" : "REMOVE CASH")} className={cashMode === "confirm" ? "bg-[#C7A76D] text-white hover:bg-[#B8985E]" : "bg-amber-700 text-white hover:bg-amber-800"}>{working ? "Saving…" : cashMode === "confirm" ? "Count as cash income" : "Remove confirmation"}</Button></DialogFooter></DialogContent></Dialog>
     </div>
   );
 }

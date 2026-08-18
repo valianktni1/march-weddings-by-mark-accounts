@@ -79,6 +79,65 @@ def test_booking_payments_reconcile_but_never_add_invoice_income_twice():
     assert result["booking_reconciliation"]["matched"] == 1
 
 
+def test_booking_cash_payment_is_included_once_without_a_bank_match():
+    result = snapshot(invoices=[{
+        "id": "inv-cash", "invoice_number": "WBM02010", "couple_names": "Cash couple",
+        "source_system": "booking_system", "include_in_totals": False,
+        "payments": [{
+            "id": "pay-cash", "paid_date": "20/06/2025", "amount": 250,
+            "payment_type": "cash",
+        }],
+    }])
+    assert result["summary"]["turnover"] == 250
+    assert result["summary"]["other_cash_income"] == 250
+    assert result["booking_reconciliation"]["confirmed_cash"] == 1
+    assert result["booking_reconciliation"]["unmatched"] == 0
+
+
+def test_accounts_confirmation_turns_an_existing_unmatched_payment_into_cash():
+    invoice = {
+        "id": "inv-old", "invoice_number": "WBM02011", "couple_names": "Earlier couple",
+        "source_system": "booking_system", "include_in_totals": False,
+        "payments": [{
+            "id": "pay-old", "paid_date": "21/06/2025", "amount": 100,
+            "payment_type": "bank_transfer",
+        }],
+    }
+    before = snapshot(invoices=[invoice])
+    assert before["summary"]["turnover"] == 0
+    assert before["booking_reconciliation"]["unmatched"] == 1
+
+    after = snapshot(invoices=[invoice], cash_confirmations=[{
+        "id": "cash-confirm-1", "tax_year": "2025-26", "source_invoice_id": "inv-old",
+        "source_payment_id": "pay-old", "reason": "Paid in cash at the wedding",
+        "confirmed_by": "mark@example.com", "created_at": "2025-06-21T20:00:00Z", "active": True,
+    }])
+    assert after["summary"]["turnover"] == 100
+    assert after["booking_reconciliation"]["confirmed_cash"] == 1
+    assert after["booking_reconciliation"]["unmatched"] == 0
+
+
+def test_cash_and_same_day_bank_receipt_blocks_double_counting():
+    result = snapshot(
+        transactions=[{
+            "id": "tx-cash-deposit", "date": "22/06/2025", "description": "Cash deposit",
+            "amount": 300, "transaction_type": "income", "tax_year": "2025-26",
+            "excluded_from_totals": False,
+        }],
+        invoices=[{
+            "id": "inv-cash", "invoice_number": "WBM02012", "couple_names": "Cash couple",
+            "source_system": "booking_system", "include_in_totals": False,
+            "payments": [{
+                "id": "pay-cash", "paid_date": "22/06/2025", "amount": 300,
+                "payment_type": "cash",
+            }],
+        }],
+    )
+    codes = {item["code"] for item in result["validation"]["checks"]}
+    assert "cash_bank_duplicates" in codes
+    assert result["validation"]["ready_to_close"] is False
+
+
 def test_explicit_cash_invoice_is_included_once_when_not_in_bank():
     result = snapshot(invoices=[{
         "id": "inv-2", "invoice_number": "CASH1", "couple_names": "Cash client",
