@@ -90,5 +90,53 @@ def test_frontend_requires_review_before_manual_pdf_import():
     assert "/invoices/import-pdf" in source
     assert "nothing is saved yet" in source
     assert "review before saving" in source
-    assert "original PDF" in source
+    assert "Next available number — assigned on Save" in source
+    assert "Create Accounts Invoice" in source
+    assert "ACCOUNTS COPY" in source
 
+
+def test_accounts_sequence_ignores_booking_and_old_source_numbers():
+    invoices = [
+        {"invoice_number": "WBM01104"},
+        {"invoice_number": "WBM01109", "source_system": "old_accounts"},
+    ]
+
+    assert server._highest_accounts_invoice_number(invoices) == 1109
+
+
+def test_public_invoice_hides_private_source_evidence_fields():
+    public = server._public_invoice({
+        "invoice_number": "WBM01110",
+        "source_invoice_number": "WBM02545",
+        "source_pdf_path": "/private/source.pdf",
+        "source_pdf_sha256": "abc123",
+    })
+
+    assert public == {"invoice_number": "WBM01110"}
+
+
+def test_recreated_pdf_keeps_layout_and_replaces_every_source_number(tmp_path):
+    import pymupdf
+
+    source_number = "WBM02545"
+    accounts_number = "WBM01110"
+    source = pymupdf.open()
+    first = source.new_page()
+    first.insert_text((72, 90), "Number", fontsize=9)
+    first.insert_text((150, 90), source_number, fontsize=9)
+    second = source.new_page()
+    second.insert_text((72, 90), f"Please use {source_number} as your reference.", fontsize=9)
+    source_bytes = source.tobytes()
+    source.close()
+    output = tmp_path / f"{accounts_number}.pdf"
+
+    replacements = server.recreate_booking_invoice_pdf(
+        source_bytes, source_number, accounts_number, output
+    )
+
+    assert replacements == 2
+    with pymupdf.open(output) as recreated:
+        text = "\n".join(page.get_text() for page in recreated)
+        assert len(recreated) == 2
+    assert source_number not in text
+    assert text.count(accounts_number) == 2

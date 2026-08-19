@@ -6,6 +6,8 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 import os
 import logging
 import shutil
@@ -51,7 +53,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.19-invoice-label-v1.4.6.1"
+BUILD_ID = "2026.08.19-accounts-renumbered-pdf-import-v1.4.7"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -1745,7 +1747,7 @@ async def scan_invoice_pdf(file: UploadFile = File(...)):
 
 @api_router.post("/invoices/import-pdf")
 async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = File(...)):
-    """Import one reviewed invoice while preserving its original PDF and number."""
+    """Recreate one reviewed Booking PDF under the next Accounts invoice number."""
     try:
         invoice = InvoiceCreate.model_validate_json(invoice_json)
     except Exception as exc:
@@ -1766,16 +1768,30 @@ async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = F
     except Exception as exc:
         raise HTTPException(status_code=400, detail="The PDF could not be verified") from exc
 
-    invoice_number = str(invoice.invoice_number or "").strip().upper()
-    if not re.fullmatch(r"WBM\d{4,8}", invoice_number):
+    source_invoice_number = str(invoice.invoice_number or "").strip().upper()
+    if not re.fullmatch(r"WBM\d{4,8}", source_invoice_number):
         raise HTTPException(status_code=422, detail="Use the WBM invoice number printed on the PDF")
-    if parsed.get("invoice_number") != invoice_number:
+    if parsed.get("invoice_number") != source_invoice_number:
         raise HTTPException(
             status_code=422,
-            detail=f'The PDF is {parsed.get("invoice_number") or "missing its number"}, not {invoice_number}',
+            detail=f'The PDF is {parsed.get("invoice_number") or "missing its number"}, not {source_invoice_number}',
         )
-    if await db.invoices.find_one({"invoice_number": invoice_number}, {"_id": 1}):
-        raise HTTPException(status_code=409, detail=f"{invoice_number} is already in Accounts")
+    source_pdf_sha256 = hashlib.sha256(content).hexdigest()
+    duplicate = await db.invoices.find_one(
+        {
+            "$or": [
+                {"source_system": "manual_pdf_import", "source_invoice_number": source_invoice_number},
+                {"source_system": "manual_pdf_import", "invoice_number": source_invoice_number},
+                {"source_system": "manual_pdf_import", "source_pdf_sha256": source_pdf_sha256},
+            ]
+        },
+        {"_id": 0, "invoice_number": 1},
+    )
+    if duplicate:
+        raise HTTPException(
+            status_code=409,
+            detail=f"That Booking invoice is already in Accounts as {duplicate.get('invoice_number', 'an invoice')}",
+        )
 
     final_due = invoice.final_payment_due or calc_final_payment_due(invoice.wedding_date)
     balance = round(invoice.total_price - invoice.deposit_amount - invoice.interim_payment, 2)
@@ -1800,10 +1816,26 @@ async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = F
 
     pdf_dir = UPLOAD_DIR / "invoices"
     pdf_dir.mkdir(parents=True, exist_ok=True)
+    source_dir = pdf_dir / "source-booking-pdfs"
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    invoice_number = await allocate_next_invoice_number()
     pdf_path = pdf_dir / f"{invoice_number}.pdf"
+    source_pdf_path = source_dir / f"{source_invoice_number}-{source_pdf_sha256[:12]}.pdf"
     if pdf_path.exists():
         raise HTTPException(status_code=409, detail=f"A stored PDF already exists for {invoice_number}")
-    pdf_path.write_bytes(content)
+
+    source_pdf_created = False
+    try:
+        recreate_booking_invoice_pdf(content, source_invoice_number, invoice_number, pdf_path)
+        if not source_pdf_path.exists():
+            source_pdf_path.write_bytes(content)
+            source_pdf_created = True
+    except Exception as exc:
+        pdf_path.unlink(missing_ok=True)
+        if source_pdf_created:
+            source_pdf_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="The Accounts copy of the PDF could not be created") from exc
 
     invoice_data = {
         "id": str(uuid.uuid4()),
@@ -1836,33 +1868,148 @@ async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = F
         "file_name": f"{invoice_number}.pdf",
         "original_file_name": original_name,
         "source_system": "manual_pdf_import",
-        "source_pdf_sha256": hashlib.sha256(content).hexdigest(),
+        "source_invoice_number": source_invoice_number,
+        "source_pdf_path": str(source_pdf_path),
+        "source_pdf_sha256": source_pdf_sha256,
         "source_pdf_preserved": True,
+        "source_pdf_recreated": True,
         "imported_at": datetime.now(timezone.utc).isoformat(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
         await db.invoices.insert_one(invoice_data)
+    except DuplicateKeyError as exc:
+        pdf_path.unlink(missing_ok=True)
+        if source_pdf_created:
+            source_pdf_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail="That Booking invoice has already been imported") from exc
     except Exception:
         pdf_path.unlink(missing_ok=True)
+        if source_pdf_created:
+            source_pdf_path.unlink(missing_ok=True)
         raise
     invoice_data.pop("_id", None)
-    return invoice_data
+    return _public_invoice(invoice_data)
+
+
+def _highest_accounts_invoice_number(invoices: List[dict]) -> int:
+    """Return the highest number in the Accounts-owned WBM sequence."""
+    max_num = 1100
+    for inv in invoices:
+        match = re.fullmatch(r"WBM(\d{4,8})", str(inv.get("invoice_number") or "").upper())
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+    return max_num
+
+
+async def _seed_accounts_invoice_counter() -> None:
+    if await db.counters.find_one({"_id": "accounts_invoice_number"}, {"_id": 1}):
+        return
+    invoices = await db.invoices.find(
+        {
+            "invoice_number": {"$regex": "^WBM"},
+            "source_system": {"$nin": ["booking_system", "manual_pdf_import"]},
+        },
+        {"invoice_number": 1, "_id": 0},
+    ).to_list(10000)
+    try:
+        await db.counters.insert_one({
+            "_id": "accounts_invoice_number",
+            "value": _highest_accounts_invoice_number(invoices),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except DuplicateKeyError:
+        pass
+
+
+async def allocate_next_invoice_number() -> str:
+    """Atomically reserve the next free Accounts invoice number."""
+    await _seed_accounts_invoice_counter()
+    while True:
+        counter = await db.counters.find_one_and_update(
+            {"_id": "accounts_invoice_number"},
+            {"$inc": {"value": 1}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}},
+            return_document=ReturnDocument.AFTER,
+        )
+        candidate = f"WBM{int(counter['value']):05d}"
+        if not await db.invoices.find_one({"invoice_number": candidate}, {"_id": 1}):
+            return candidate
 
 
 async def get_next_invoice_number():
-    """Get next auto-incrementing invoice number starting from WBM01101"""
-    invoices = await db.invoices.find({"invoice_number": {"$regex": "^WBM"}}, {"invoice_number": 1, "_id": 0}).to_list(10000)
-    max_num = 1100
-    for inv in invoices:
-        num_str = inv.get("invoice_number", "").replace("WBM", "")
-        try:
-            num = int(num_str)
-            if num > max_num:
-                max_num = num
-        except (ValueError, TypeError):
-            pass
-    return f"WBM{max_num + 1:05d}"
+    """Backward-compatible alias which now reserves a concurrency-safe number."""
+    return await allocate_next_invoice_number()
+
+
+def _pdf_text_colour(value: int) -> tuple:
+    return (((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255)
+
+
+def recreate_booking_invoice_pdf(content: bytes, source_number: str, accounts_number: str, output_path: Path) -> int:
+    """Preserve the source design while replacing every printed invoice-number occurrence."""
+    import pymupdf
+
+    replacements = 0
+    with pymupdf.open(stream=content, filetype="pdf") as doc:
+        for page in doc:
+            spans = [
+                span
+                for block in page.get_text("dict").get("blocks", [])
+                for line in block.get("lines", [])
+                for span in line.get("spans", [])
+                if source_number in span.get("text", "")
+            ]
+            occurrences = page.search_for(source_number)
+            replacements += len(occurrences)
+            styled_occurrences = []
+            for rect in occurrences:
+                span = next(
+                    (item for item in spans if pymupdf.Rect(item["bbox"]).intersects(rect)),
+                    {},
+                )
+                styled_occurrences.append((rect, span))
+                page.add_redact_annot(
+                    rect + (-0.35, -0.35, 0.35, 0.35),
+                    fill=None,
+                    cross_out=False,
+                )
+            if occurrences:
+                page.apply_redactions(
+                    images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                    text=pymupdf.PDF_REDACT_TEXT_REMOVE,
+                )
+            for rect, span in styled_occurrences:
+                font_name = "hebo" if "bold" in str(span.get("font", "")).lower() else "helv"
+                font_size = float(span.get("size") or 9)
+                colour = _pdf_text_colour(int(span.get("color") or 0))
+                baseline = float((span.get("origin") or (rect.x0, rect.y1 - 2))[1])
+                page.insert_text(
+                    (rect.x0, baseline),
+                    accounts_number,
+                    fontname=font_name,
+                    fontsize=font_size,
+                    color=colour,
+                    overlay=True,
+                )
+        if replacements == 0:
+            raise ValueError("The printed Booking invoice number could not be located")
+        doc.save(str(output_path), garbage=4, deflate=True)
+
+    with pymupdf.open(str(output_path)) as recreated:
+        recreated_text = "\n".join(page.get_text() for page in recreated)
+    if source_number in recreated_text or accounts_number not in recreated_text:
+        output_path.unlink(missing_ok=True)
+        raise ValueError("The recreated invoice number could not be verified")
+    return replacements
+
+
+def _public_invoice(invoice: dict) -> dict:
+    public = dict(invoice)
+    public.pop("source_invoice_number", None)
+    public.pop("source_pdf_path", None)
+    public.pop("source_pdf_sha256", None)
+    return public
 
 
 def generate_invoice_pdf(invoice_data: dict, output_path: str):
@@ -2233,7 +2380,7 @@ async def get_invoices(tax_year: Optional[str] = None):
     if tax_year:
         query["tax_year"] = tax_year
     invoices = await db.invoices.find(query, {"_id": 0}).to_list(10000)
-    return invoices
+    return [_public_invoice(invoice) for invoice in invoices]
 
 
 @api_router.put("/invoices/{invoice_id}")
@@ -2542,6 +2689,7 @@ async def delete_invoice(invoice_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Invoice not found")
     _delete_managed_upload(invoice.get("file_path"))
+    _delete_managed_upload(invoice.get("source_pdf_path"))
     return {"status": "deleted"}
 
 
@@ -4062,6 +4210,24 @@ async def startup_checks():
             "source_invoice_id": {"$type": "string"},
         },
         name="unique_booking_source_invoice",
+    )
+    await db.invoices.create_index(
+        [("source_system", 1), ("source_invoice_number", 1)],
+        unique=True,
+        partialFilterExpression={
+            "source_system": "manual_pdf_import",
+            "source_invoice_number": {"$type": "string"},
+        },
+        name="unique_manual_booking_invoice_number",
+    )
+    await db.invoices.create_index(
+        [("source_system", 1), ("source_pdf_sha256", 1)],
+        unique=True,
+        partialFilterExpression={
+            "source_system": "manual_pdf_import",
+            "source_pdf_sha256": {"$type": "string"},
+        },
+        name="unique_manual_booking_invoice_pdf",
     )
     await db.integration_events.create_index("event_id", unique=True, name="unique_integration_event")
     await db.invoice_audit_logs.create_index(

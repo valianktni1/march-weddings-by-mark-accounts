@@ -99,17 +99,26 @@ const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel, linked = fa
       {showPdfFields && (
         <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 space-y-2" data-testid="invoice-import-review">
           <p className="text-sm font-semibold text-emerald-900">PDF read successfully — review before saving</p>
-          <p className="text-xs text-emerald-800">The original PDF and its printed invoice number will be retained. You remain in control of every field below.</p>
+          <p className="text-xs text-emerald-800">Accounts will recreate the same PDF design with its own next invoice number. The uploaded original is retained privately for duplicate protection and audit history.</p>
           {(scanResult?.warnings || []).map((warning, index) => <p key={index} className="text-xs text-amber-800">• {warning}</p>)}
         </div>
       )}
       {importingPdf && (
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-2">
-            <Label>Invoice Number *</Label>
-            <Input value={formData.invoice_number} onChange={(e) => setFormData({ ...formData, invoice_number: e.target.value.toUpperCase() })} required className="border-stone-200 font-mono" data-testid="invoice-number-input" />
+            <Label>Booking PDF Number</Label>
+            <div className="h-9 flex items-center px-3 rounded-md bg-stone-100 border border-stone-200 font-mono text-sm" data-testid="source-invoice-number">
+              {formData.invoice_number || "Not found"}
+            </div>
+            <p className="text-xs text-stone-400">Kept privately; it will not become the Accounts number.</p>
           </div>
           <div className="space-y-2">
+            <Label>New Accounts Number</Label>
+            <div className="h-9 flex items-center px-3 rounded-md bg-amber-50 border border-amber-200 font-semibold text-sm text-amber-900" data-testid="accounts-number-pending">
+              Next available number — assigned on Save
+            </div>
+          </div>
+          <div className="space-y-2 col-span-2">
             <Label>Issue Date</Label>
             <Input type="date" value={formData.issue_date} onChange={(e) => setFormData({ ...formData, issue_date: e.target.value })} className="border-stone-200" data-testid="invoice-issue-date-input" />
           </div>
@@ -337,8 +346,8 @@ export const Invoices = () => {
         const upload = new FormData();
         upload.append("file", sourcePdf);
         upload.append("invoice_json", JSON.stringify(buildPayload()));
-        await axios.post(`${API}/invoices/import-pdf`, upload);
-        toast.success(`${formData.invoice_number} imported — original PDF retained`);
+        const response = await axios.post(`${API}/invoices/import-pdf`, upload);
+        toast.success(`${response.data.invoice_number} created — Accounts copy ready`);
       } else {
         await axios.post(`${API}/invoices`, buildPayload());
         toast.success("Invoice created with PDF");
@@ -367,7 +376,7 @@ export const Invoices = () => {
         ? `${API}/invoices/${editInvoice.id}/emergency-edit`
         : `${API}/invoices/${editInvoice.id}`;
       await axios.put(endpoint, linked ? { ...buildPayload(), reason: emergencyReason.trim() } : buildPayload());
-      toast.success(linked ? "Accounts copy updated and safely locked" : editInvoice.source_system === "manual_pdf_import" ? "Accounts details updated — original PDF preserved" : "Invoice updated & PDF regenerated");
+      toast.success(linked ? "Accounts copy updated and safely locked" : editInvoice.source_system === "manual_pdf_import" ? "Accounts details updated — source evidence preserved" : "Invoice updated & PDF regenerated");
       setEditInvoice(null);
       setEmergencyReason("");
       setFormData(emptyForm);
@@ -499,7 +508,7 @@ export const Invoices = () => {
                 onSubmit={handleCreate}
                 importingPdf={!!sourcePdf}
                 scanResult={scanResult}
-                submitLabel={submitting ? "Saving..." : sourcePdf ? `Import ${formData.invoice_number || "Reviewed Invoice"}` : "Create Invoice & Generate PDF"}
+                submitLabel={submitting ? "Saving..." : sourcePdf ? "Create Accounts Invoice" : "Create Invoice & Generate PDF"}
               />
             </DialogContent>
           </Dialog>
@@ -529,7 +538,7 @@ export const Invoices = () => {
               ) : (
                 filteredInvoices.map((inv) => (
                   <TableRow key={inv.id} className="border-stone-100" data-testid={`invoice-row-${inv.id}`}>
-                    <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}{inv.source_system === "booking_system" && <span className="block mt-1 text-[10px] font-sans text-teal-700">BOOKING LINKED</span>}{inv.source_system === "manual_pdf_import" && <span className="block mt-1 text-[10px] font-sans text-stone-500">INVOICE</span>}{inv.legacy_invoice_number && inv.legacy_invoice_number !== inv.invoice_number && <span className="block mt-1 text-[10px] font-sans text-stone-500">Previous Studio Ninja: {inv.legacy_invoice_number}</span>}</TableCell>
+                    <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}{inv.source_system === "booking_system" && <span className="block mt-1 text-[10px] font-sans text-teal-700">BOOKING LINKED</span>}{inv.source_system === "manual_pdf_import" && <span className="block mt-1 text-[10px] font-sans text-stone-500">ACCOUNTS COPY</span>}{inv.legacy_invoice_number && inv.legacy_invoice_number !== inv.invoice_number && <span className="block mt-1 text-[10px] font-sans text-stone-500">Previous Studio Ninja: {inv.legacy_invoice_number}</span>}</TableCell>
                     <TableCell className="font-medium">{getName(inv)}</TableCell>
                     <TableCell className="font-mono text-sm">{getDate(inv)}</TableCell>
                     <TableCell className="text-stone-500 text-sm max-w-[180px] truncate">{inv.package_name || (inv.notes ? inv.notes.substring(0, 30) : "-")}</TableCell>
@@ -621,7 +630,7 @@ export const Invoices = () => {
                   </div>
                 </div>
               )}
-              <InvoiceForm formData={formData} setFormData={setFormData} onSubmit={handleUpdate} linked={editInvoice.source_system === "booking_system"} showPdfFields={editInvoice.source_system === "manual_pdf_import"} submitLabel={submitting ? "Saving..." : editInvoice.source_system === "booking_system" ? "Save Accounts Override & Regenerate PDF" : editInvoice.source_system === "manual_pdf_import" ? "Save Details & Preserve Original PDF" : "Save Changes & Regenerate PDF"} />
+              <InvoiceForm formData={formData} setFormData={setFormData} onSubmit={handleUpdate} linked={editInvoice.source_system === "booking_system"} showPdfFields={editInvoice.source_system === "manual_pdf_import"} submitLabel={submitting ? "Saving..." : editInvoice.source_system === "booking_system" ? "Save Accounts Override & Regenerate PDF" : editInvoice.source_system === "manual_pdf_import" ? "Save Details & Preserve Source Evidence" : "Save Changes & Regenerate PDF"} />
             </>
           )}
         </DialogContent>

@@ -1,0 +1,25 @@
+ACCOUNTS V1.4.7 — TRUENAS DEPLOYMENT
+=====================================
+
+1. Upload the complete extracted release to the main branch of:
+   https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+2. In the TrueNAS shell, run these commands exactly:
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d backend frontend
+
+docker compose -f "$ACCOUNTS_COMPOSE" ps
+curl -fsS http://127.0.0.1:30053/api/health
+echo
+
+Expected build:
+2026.08.19-accounts-renumbered-pdf-import-v1.4.7
+
+IMPORTANT
+---------
+- Keep BOOKING_INTEGRATION_ENABLED set to "false" in the Accounts compose file.
+- No database migration command is required.
+- Existing invoice records and PDFs are not changed.
