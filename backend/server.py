@@ -16,6 +16,7 @@ import mimetypes
 import re
 import secrets
 import time
+import hashlib
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, Dict, List, Optional
@@ -50,7 +51,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.18-old-accounts-migration-ready-v1.4.5"
+BUILD_ID = "2026.08.19-manual-booking-pdf-import-v1.4.6"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -123,6 +124,7 @@ class Invoice(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     invoice_number: Optional[str] = None
+    issue_date: Optional[str] = None
     couple_names: str = ""
     client_address: Optional[str] = None
     client_email: Optional[str] = None
@@ -144,6 +146,7 @@ class Invoice(BaseModel):
     tax_year: str = ""
     package_name: Optional[str] = None
     notes: Optional[str] = None
+    line_items: List[Dict[str, Any]] = Field(default_factory=list)
     file_path: Optional[str] = None
     file_name: Optional[str] = None
     include_in_totals: bool = False
@@ -151,6 +154,8 @@ class Invoice(BaseModel):
 
 
 class InvoiceCreate(BaseModel):
+    invoice_number: Optional[str] = None
+    issue_date: Optional[str] = None
     couple_names: str
     client_address: Optional[str] = None
     client_email: Optional[str] = None
@@ -163,8 +168,10 @@ class InvoiceCreate(BaseModel):
     interim_payment: float = 0
     interim_payment_date: Optional[str] = None
     final_payment_paid_date: Optional[str] = None
+    final_payment_due: Optional[str] = None
     package_name: Optional[str] = None
     notes: Optional[str] = None
+    line_items: List[Dict[str, Any]] = Field(default_factory=list)
     include_in_totals: bool = False
 
 
@@ -1555,154 +1562,292 @@ async def download_tax_year_pack(tax_year: str):
 
 # Invoice endpoints
 
+
+def _invoice_pdf_date(value: str) -> Optional[str]:
+    """Return a PDF date as DD/MM/YYYY, accepting long UK and numeric dates."""
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+    for fmt in ("%d %B %Y", "%d %b %Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(cleaned, fmt).strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    return None
+
+
+def _invoice_pdf_money(value: str) -> float:
+    return round(float(str(value).replace(",", "").strip()), 2)
+
+
+def parse_booking_invoice_text(text: str) -> dict:
+    """Parse a native BookingSystem2026 invoice without AI or external services."""
+    if not str(text or "").strip():
+        raise ValueError("The PDF does not contain selectable text")
+
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    result: Dict[str, Any] = {
+        "invoice_number": "",
+        "issue_date": "",
+        "booking_fee_due": "",
+        "final_payment_due": "",
+        "couple_names": "",
+        "client_address": "",
+        "client_email": "",
+        "client_phone": "",
+        "wedding_date": "",
+        "venue": "",
+        "total_price": 0.0,
+        "deposit_amount": 0.0,
+        "deposit_paid_date": "",
+        "balance_remaining": 0.0,
+        "package_name": "",
+        "notes": "",
+        "line_items": [],
+        "warnings": [],
+        "parser": "bookingsystem2026-native-v1",
+    }
+
+    def labelled(label: str) -> str:
+        match = re.search(rf"(?im)^\s*{label}\s+(.+?)\s*$", text)
+        return match.group(1).strip() if match else ""
+
+    number = labelled(r"Number") or labelled(r"Invoice\s*(?:number|no\.?)")
+    if number:
+        number_match = re.search(r"\bWBM\d{4,8}\b", number, re.IGNORECASE)
+        result["invoice_number"] = number_match.group(0).upper() if number_match else number.strip()
+
+    for key, label in (
+        ("issue_date", r"Issue\s+date"),
+        ("booking_fee_due", r"Booking\s+fee\s+due"),
+        ("final_payment_due", r"Final\s+balance\s+due"),
+        ("wedding_date", r"Supply\s+date"),
+    ):
+        raw = labelled(label)
+        parsed = _invoice_pdf_date(raw)
+        if parsed:
+            result[key] = parsed
+
+    bill_to_at = next((idx for idx, line in enumerate(lines) if line.upper() == "BILL TO"), -1)
+    description_at = next((idx for idx, line in enumerate(lines) if line.upper() == "DESCRIPTION"), len(lines))
+    client_lines = lines[bill_to_at + 1:description_at] if bill_to_at >= 0 else lines[:description_at]
+    client_email_index = next(
+        (idx for idx, line in enumerate(client_lines) if re.fullmatch(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", line)),
+        -1,
+    )
+    if client_email_index >= 0:
+        result["client_email"] = client_lines[client_email_index]
+        metadata = re.compile(
+            r"^(?:Number|Issue date|Booking fee due|Final balance due|Supply date)\b",
+            re.IGNORECASE,
+        )
+        for candidate in reversed(client_lines[:client_email_index]):
+            if candidate.upper() != "INVOICE" and not metadata.match(candidate):
+                result["couple_names"] = candidate
+                break
+        after_email = client_lines[client_email_index + 1:]
+        if after_email and re.fullmatch(r"[+\d][\d\s()-]{7,}", after_email[0]):
+            result["client_phone"] = re.sub(r"\s+", "", after_email.pop(0))
+        if after_email:
+            result["client_address"] = ", ".join(after_email)
+
+    def amount_after(label: str) -> float:
+        match = re.search(rf"(?im)^\s*{label}\s*$\s*^\s*£([\d,]+(?:\.\d{{1,2}})?)\s*$", text)
+        return _invoice_pdf_money(match.group(1)) if match else 0.0
+
+    result["total_price"] = amount_after("Subtotal") or amount_after("Total")
+    result["deposit_amount"] = amount_after("Paid")
+    result["balance_remaining"] = amount_after("TOTAL OUTSTANDING")
+
+    try:
+        desc_start = next(idx for idx, line in enumerate(lines) if line.upper() == "DESCRIPTION")
+        amount_header = next(idx for idx in range(desc_start + 1, len(lines)) if lines[idx].upper() == "AMOUNT")
+        subtotal_at = next(idx for idx in range(amount_header + 1, len(lines)) if lines[idx].upper() == "SUBTOTAL")
+        section = lines[amount_header + 1:subtotal_at]
+        money_indexes = [
+            idx for idx, line in enumerate(section)
+            if re.fullmatch(r"£[\d,]+(?:\.\d{1,2})?", line)
+        ]
+        items = []
+        for position, money_idx in enumerate(money_indexes):
+            name_idx = 0 if position == 0 else money_idx - 1
+            if position > 0:
+                name_idx = money_idx - 1
+            name = section[name_idx].strip()
+            if not name or name.startswith("£"):
+                continue
+            next_money = money_indexes[position + 1] if position + 1 < len(money_indexes) else len(section)
+            description_end = next_money - 1 if position + 1 < len(money_indexes) else next_money
+            description = section[money_idx + 1:description_end]
+            items.append({
+                "description": name,
+                "detail": "\n".join(description).strip(),
+                "amount": _invoice_pdf_money(section[money_idx][1:]),
+            })
+        result["line_items"] = items
+        if items:
+            result["package_name"] = " + ".join(item["description"] for item in items)
+            note_parts = []
+            for item in items:
+                part = f'{item["description"]} — £{item["amount"]:,.2f}'
+                if item["detail"]:
+                    part += f'\n{item["detail"]}'
+                note_parts.append(part)
+            result["notes"] = "\n\n".join(note_parts)
+    except (StopIteration, ValueError):
+        result["warnings"].append("Package lines could not be separated; please enter them manually.")
+
+    if result["deposit_amount"] > 0 and result["issue_date"]:
+        result["deposit_paid_date"] = result["issue_date"]
+        result["warnings"].append(
+            "The PDF shows an amount paid but not its exact payment date. The issue date was pre-filled; please check it."
+        )
+    if not result["venue"]:
+        result["warnings"].append("The venue is not printed on this invoice; enter it if you want it in Accounts.")
+
+    required = ("invoice_number", "couple_names", "wedding_date", "total_price")
+    missing = [field.replace("_", " ") for field in required if not result.get(field)]
+    if missing:
+        result["warnings"].append("Please complete: " + ", ".join(missing) + ".")
+    result["ready_for_review"] = not missing
+    return result
+
+
 @api_router.post("/invoices/scan-pdf")
 async def scan_invoice_pdf(file: UploadFile = File(...)):
-    """Extract invoice/booking data from a PDF using pymupdf — zero credits, fully local"""
-    import re
+    """Preview a BookingSystem invoice locally. This endpoint never saves data or files."""
     try:
         import pymupdf
     except ImportError:
         raise HTTPException(status_code=500, detail="pymupdf not installed")
 
-    content, _, _ = await _read_upload(file, {".pdf"})
-    doc = pymupdf.open(stream=content, filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    doc.close()
+    content, _, original_name = await _read_upload(file, {".pdf"})
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=400, detail="The selected file is not a valid PDF")
+    try:
+        with pymupdf.open(stream=content, filetype="pdf") as doc:
+            if doc.needs_pass:
+                raise HTTPException(status_code=400, detail="Password-protected PDFs cannot be imported")
+            text = "\n".join(page.get_text() for page in doc)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="The PDF could not be read") from exc
 
     if not text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from PDF. This may be a scanned image.")
-
-    result = {
-        "couple_names": "",
-        "total_price": 0,
-        "deposit_amount": 0,
-        "venue": "",
-        "wedding_date": "",
-        "package_name": "",
-        "notes": "",
-        "client_address": "",
-        "client_email": "",
-        "client_phone": "",
-        "raw_text": text[:800],
-    }
-
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-    months_map = {"jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
-                  "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12"}
-
-    # --- Couple Names: first line after "INVOICE FOR" that isn't metadata ---
-    for i, line in enumerate(lines):
-        if re.match(r'INVOICE\s*FOR', line, re.IGNORECASE):
-            for j in range(i + 1, min(i + 3, len(lines))):
-                c = lines[j].strip()
-                if c and not c.lower().startswith(("phone", "email", "invoice id", "issue date", "from")) and "@" not in c and not c.startswith("£"):
-                    result["couple_names"] = c
-                    break
-            break
-
-    # --- Phone & Email ---
-    # pymupdf interleaves columns: CLIENT info appears FIRST, BUSINESS info SECOND
-    phones = re.findall(r'Phone\s*number:\s*([\d\s]+)', text, re.IGNORECASE)
-    emails = re.findall(r'Email:\s*([\w.+-]+@[\w-]+\.[\w.-]+)', text, re.IGNORECASE)
-
-    # First phone/email = client, filter out business ones
-    for p in phones:
-        p = p.strip()
-        if "07712117357" not in p:
-            result["client_phone"] = p
-            break
-    for e in emails:
-        if "markpowell" not in e.lower() and "googlemail" not in e.lower() and "weddingsbymark" not in e.lower():
-            result["client_email"] = e.strip()
-            break
-
-    # --- Client Address: lines between client email and FROM/business markers ---
-    addr_parts = []
-    collecting = False
-    for i, line in enumerate(lines):
-        if result["client_email"] and result["client_email"] in line:
-            collecting = True
-            continue
-        if collecting:
-            if line in ("FROM", "Weddings By Mark") or line.lower().startswith("phone number: 07712") or "Enquiry Form" in line:
-                continue
-            if re.match(r'(Wedding|Product|Package|Description|Subtotal|Total|NOTES|Status|Business Number)', line, re.IGNORECASE):
-                break
-            if line.startswith("£") or line == "Invoice" or "M22 5AX" in line or "Ashurst" in line or "Kingdom" in line or "manchester" in line.lower():
-                continue
-            if "Stacey" in line or (result["couple_names"] and result["couple_names"] in line):
-                continue
-            addr_parts.append(line)
-    if addr_parts:
-        result["client_address"] = re.sub(r',\s*,', ',', ", ".join(addr_parts)).strip(', ')
-
-    # --- Wedding Date: find "DD Mon YYYY" date pattern near "Wedding" line ---
-    for i, line in enumerate(lines):
-        if line.strip() == "Wedding":
-            # Search nearby lines (interleaved columns may put other lines between)
-            for j in range(i + 1, min(i + 4, len(lines))):
-                match = re.match(r'^(\d{1,2})\s+(\w{3,9})\s+(\d{4})$', lines[j].strip())
-                if match:
-                    day = match.group(1).zfill(2)
-                    mon = months_map.get(match.group(2).lower()[:3], "01")
-                    year = match.group(3)
-                    result["wedding_date"] = f"{day}/{mon}/{year}"
-                    break
-            break
-    # Fallback: "Wedding Date: DD/MM/YYYY"
-    if not result["wedding_date"]:
-        wd = re.search(r'Wedding\s*Date[:\s]*(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})', text, re.IGNORECASE)
-        if wd:
-            result["wedding_date"] = wd.group(1).replace("-", "/")
-
-    # --- Venue: look for a line with hotel/hall/barn/castle type keywords ---
-    venue_keywords = r'\b(Hotel|Hall|Barn|Castle|Manor|House|Farm|Lodge|Estate|Centre|Club|Gardens|Church|Chapel|Registry)\b'
-    for line in lines:
-        if re.search(venue_keywords, line, re.IGNORECASE) and "Ashurst" not in line and "MANCHESTER" not in line:
-            v = line.strip().rstrip(',')
-            # Check next line for continuation (e.g., "UK")
-            idx = lines.index(line)
-            if idx + 1 < len(lines):
-                nxt = lines[idx + 1].strip()
-                if nxt in ("UK", "United Kingdom", "England") or (len(nxt) < 15 and not re.match(r'(Product|Package|Description|Ashurst)', nxt)):
-                    v = v + ", " + nxt
-            result["venue"] = v
-            break
-    # Fallback: "Venue:" label
-    if not result["venue"]:
-        vm = re.search(r'Venue[:\s]+(.+?)(?:\n|$)', text, re.IGNORECASE)
-        if vm:
-            result["venue"] = vm.group(1).strip()
-
-    # --- Total Price ---
-    total_match = re.search(r'\bTotal\b\s*\n?\s*£([\d,]+\.?\d*)', text)
-    if total_match:
-        result["total_price"] = float(total_match.group(1).replace(",", ""))
-
-    # --- Deposit: look for deposit keyword or first substantial payment ---
-    dep_match = re.search(r'(?:Deposit|Booking\s*Fee|Retainer)\s*[:\s]*£?([\d,]+\.?\d*)', text, re.IGNORECASE)
-    if dep_match:
-        val = float(dep_match.group(1).replace(",", ""))
-        if 0 < val < result.get("total_price", 99999):
-            result["deposit_amount"] = val
-
-    # --- Package Name: first content line after header row in Product/Package section ---
-    for i, line in enumerate(lines):
-        if line == "Amount" and i > 0:
-            # Check if this is in the Product/Package section
-            nearby = " ".join(lines[max(0, i-4):i])
-            if "Product" in nearby or "Package" in nearby:
-                for j in range(i + 1, min(i + 3, len(lines))):
-                    ln = lines[j].strip()
-                    if ln and not ln.startswith("£") and ln not in ("Description", "Unit Price", "Quantity"):
-                        result["package_name"] = ln
-                        break
-                break
-
+    try:
+        result = parse_booking_invoice_text(text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result["file_name"] = original_name
+    result["file_sha256"] = hashlib.sha256(content).hexdigest()
     return result
+
+
+@api_router.post("/invoices/import-pdf")
+async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = File(...)):
+    """Import one reviewed invoice while preserving its original PDF and number."""
+    try:
+        invoice = InvoiceCreate.model_validate_json(invoice_json)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="The reviewed invoice fields are invalid") from exc
+
+    content, _, original_name = await _read_upload(file, {".pdf"})
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=400, detail="The selected file is not a valid PDF")
+    try:
+        import pymupdf
+        with pymupdf.open(stream=content, filetype="pdf") as doc:
+            if doc.needs_pass:
+                raise HTTPException(status_code=400, detail="Password-protected PDFs cannot be imported")
+            text = "\n".join(page.get_text() for page in doc)
+        parsed = parse_booking_invoice_text(text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="The PDF could not be verified") from exc
+
+    invoice_number = str(invoice.invoice_number or "").strip().upper()
+    if not re.fullmatch(r"WBM\d{4,8}", invoice_number):
+        raise HTTPException(status_code=422, detail="Use the WBM invoice number printed on the PDF")
+    if parsed.get("invoice_number") != invoice_number:
+        raise HTTPException(
+            status_code=422,
+            detail=f'The PDF is {parsed.get("invoice_number") or "missing its number"}, not {invoice_number}',
+        )
+    if await db.invoices.find_one({"invoice_number": invoice_number}, {"_id": 1}):
+        raise HTTPException(status_code=409, detail=f"{invoice_number} is already in Accounts")
+
+    final_due = invoice.final_payment_due or calc_final_payment_due(invoice.wedding_date)
+    balance = round(invoice.total_price - invoice.deposit_amount - invoice.interim_payment, 2)
+    deposit_tax_year = calc_tax_year_from_date(invoice.deposit_paid_date) if invoice.deposit_paid_date else None
+    interim_tax_year = calc_tax_year_from_date(invoice.interim_payment_date) if invoice.interim_payment_date else None
+    final_tax_year = (
+        calc_tax_year_from_date(invoice.final_payment_paid_date)
+        if invoice.final_payment_paid_date
+        else calc_tax_year_from_date(final_due) if final_due else None
+    )
+    if invoice.final_payment_paid_date:
+        status = "Paid in Full"
+    elif invoice.interim_payment > 0 and invoice.interim_payment_date:
+        status = "Interim Paid"
+    elif invoice.deposit_paid_date:
+        status = "Deposit Paid"
+    else:
+        status = "Pending"
+    main_tax_year = deposit_tax_year or calc_tax_year_from_date(invoice.wedding_date) or ""
+    if invoice.include_in_totals:
+        await _assert_tax_years_open({deposit_tax_year, interim_tax_year, final_tax_year, main_tax_year})
+
+    pdf_dir = UPLOAD_DIR / "invoices"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = pdf_dir / f"{invoice_number}.pdf"
+    if pdf_path.exists():
+        raise HTTPException(status_code=409, detail=f"A stored PDF already exists for {invoice_number}")
+    pdf_path.write_bytes(content)
+
+    invoice_data = {
+        "id": str(uuid.uuid4()),
+        "invoice_number": invoice_number,
+        "issue_date": invoice.issue_date,
+        "couple_names": invoice.couple_names,
+        "client_address": invoice.client_address,
+        "client_email": invoice.client_email,
+        "client_phone": invoice.client_phone,
+        "wedding_date": invoice.wedding_date,
+        "venue": invoice.venue,
+        "total_price": invoice.total_price,
+        "deposit_amount": invoice.deposit_amount,
+        "deposit_paid_date": invoice.deposit_paid_date,
+        "deposit_tax_year": deposit_tax_year,
+        "interim_payment": invoice.interim_payment,
+        "interim_payment_date": invoice.interim_payment_date,
+        "interim_tax_year": interim_tax_year,
+        "final_payment_due": final_due,
+        "final_payment_paid_date": invoice.final_payment_paid_date,
+        "final_tax_year": final_tax_year,
+        "balance_remaining": balance,
+        "status": status,
+        "tax_year": main_tax_year,
+        "package_name": invoice.package_name,
+        "notes": invoice.notes,
+        "line_items": invoice.line_items,
+        "include_in_totals": invoice.include_in_totals,
+        "file_path": str(pdf_path),
+        "file_name": f"{invoice_number}.pdf",
+        "original_file_name": original_name,
+        "source_system": "manual_pdf_import",
+        "source_pdf_sha256": hashlib.sha256(content).hexdigest(),
+        "source_pdf_preserved": True,
+        "imported_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        await db.invoices.insert_one(invoice_data)
+    except Exception:
+        pdf_path.unlink(missing_ok=True)
+        raise
+    invoice_data.pop("_id", None)
+    return invoice_data
 
 
 async def get_next_invoice_number():
@@ -2015,7 +2160,7 @@ def calc_tax_year_from_date(date_str):
 @api_router.post("/invoices")
 async def create_invoice(invoice: InvoiceCreate):
     inv_num = await get_next_invoice_number()
-    final_due = calc_final_payment_due(invoice.wedding_date)
+    final_due = invoice.final_payment_due or calc_final_payment_due(invoice.wedding_date)
     balance = invoice.total_price - invoice.deposit_amount - invoice.interim_payment
 
     # Auto-calculate tax year per payment
@@ -2041,6 +2186,7 @@ async def create_invoice(invoice: InvoiceCreate):
     invoice_data = {
         "id": str(uuid.uuid4()),
         "invoice_number": inv_num,
+        "issue_date": invoice.issue_date,
         "couple_names": invoice.couple_names,
         "client_address": invoice.client_address,
         "client_email": invoice.client_email,
@@ -2062,6 +2208,7 @@ async def create_invoice(invoice: InvoiceCreate):
         "tax_year": main_tax_year,
         "package_name": invoice.package_name,
         "notes": invoice.notes,
+        "line_items": invoice.line_items,
         "include_in_totals": invoice.include_in_totals,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -2100,10 +2247,11 @@ async def update_invoice(invoice_id: str, body: dict):
     await _assert_tax_years_open(_invoice_cash_tax_years(existing))
 
     # Merge updates
-    for key in ["couple_names", "client_address", "client_email", "client_phone",
+    for key in ["issue_date", "couple_names", "client_address", "client_email", "client_phone",
                  "wedding_date", "venue", "total_price", "deposit_amount",
                  "deposit_paid_date", "interim_payment", "interim_payment_date",
-                 "final_payment_paid_date", "package_name", "notes", "include_in_totals"]:
+                 "final_payment_due", "final_payment_paid_date", "package_name", "notes",
+                 "line_items", "include_in_totals"]:
         if key in body:
             existing[key] = body[key]
 
@@ -2117,7 +2265,7 @@ async def update_invoice(invoice_id: str, body: dict):
     int_date = existing.get("interim_payment_date")
     final_paid_date = existing.get("final_payment_paid_date")
     wedding_date = existing.get("wedding_date")
-    final_due = calc_final_payment_due(wedding_date) if wedding_date else existing.get("final_payment_due")
+    final_due = existing.get("final_payment_due") or (calc_final_payment_due(wedding_date) if wedding_date else None)
 
     deposit_ty = calc_tax_year_from_date(dep_date) if dep_date else None
     interim_ty = calc_tax_year_from_date(int_date) if int_date else None
@@ -2134,6 +2282,7 @@ async def update_invoice(invoice_id: str, body: dict):
         status = "Pending"
 
     updates = {
+        "issue_date": existing.get("issue_date"),
         "couple_names": existing.get("couple_names", ""),
         "client_address": existing.get("client_address"),
         "client_email": existing.get("client_email"),
@@ -2155,6 +2304,7 @@ async def update_invoice(invoice_id: str, body: dict):
         "tax_year": deposit_ty or calc_tax_year_from_date(wedding_date) or existing.get("tax_year", ""),
         "package_name": existing.get("package_name"),
         "notes": existing.get("notes"),
+        "line_items": existing.get("line_items") or [],
         "include_in_totals": existing.get("include_in_totals", False),
     }
 
@@ -2162,7 +2312,7 @@ async def update_invoice(invoice_id: str, body: dict):
 
     # Regenerate PDF if invoice has a number
     inv_num = existing.get("invoice_number")
-    if inv_num:
+    if inv_num and existing.get("source_system") != "manual_pdf_import":
         merged = {**existing, **updates}
         pdf_dir = UPLOAD_DIR / "invoices"
         pdf_dir.mkdir(parents=True, exist_ok=True)

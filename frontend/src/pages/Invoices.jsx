@@ -35,7 +35,7 @@ function toUK(isoDate) {
   return isoDate;
 }
 
-const PdfScanUpload = ({ onScanned }) => {
+const PdfScanUpload = ({ onScanned, selectedFile, scanResult, onClear }) => {
   const [scanning, setScanning] = useState(false);
   const fileRef = useRef(null);
   const handleScan = async (e) => {
@@ -49,41 +49,72 @@ const PdfScanUpload = ({ onScanned }) => {
       const res = await axios.post(`${API}/invoices/scan-pdf`, fd);
       const d = res.data;
       const mapped = {};
+      if (d.invoice_number) mapped.invoice_number = d.invoice_number;
+      if (d.issue_date) mapped.issue_date = toISO(d.issue_date);
       if (d.couple_names) mapped.couple_names = d.couple_names;
-      if (d.total_price) mapped.total_price = String(d.total_price);
-      if (d.deposit_amount) mapped.deposit_amount = String(d.deposit_amount);
+      if (d.total_price !== undefined) mapped.total_price = String(d.total_price);
+      if (d.deposit_amount !== undefined) mapped.deposit_amount = String(d.deposit_amount);
+      if (d.deposit_paid_date) mapped.deposit_paid_date = toISO(d.deposit_paid_date);
+      if (d.final_payment_due) mapped.final_payment_due = toISO(d.final_payment_due);
       if (d.venue) mapped.venue = d.venue;
       if (d.package_name) mapped.package_name = d.package_name;
       if (d.wedding_date) mapped.wedding_date = toISO(d.wedding_date);
       if (d.notes) mapped.notes = d.notes;
+      if (d.line_items) mapped.line_items = d.line_items;
       if (d.client_address) mapped.client_address = d.client_address;
       if (d.client_email) mapped.client_email = d.client_email;
       if (d.client_phone) mapped.client_phone = d.client_phone;
-      onScanned(mapped);
-      toast.success("PDF scanned — form pre-filled");
+      onScanned(mapped, file, d);
+      toast.success("PDF read — check every field before importing");
     } catch (err) {
       toast.error(err?.response?.data?.detail || "Failed to scan PDF");
     } finally {
       setScanning(false);
-      if (fileRef.current) fileRef.current.value = "";
+      if (!selectedFile && fileRef.current) fileRef.current.value = "";
     }
   };
   return (
     <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-md" data-testid="pdf-scan-upload">
       <Upload className="w-4 h-4 text-amber-600 shrink-0" />
       <div className="flex-1 min-w-0">
-        <p className="text-xs text-amber-800 font-medium">Scan an existing invoice PDF to pre-fill the form</p>
-        <input ref={fileRef} type="file" accept=".pdf" onChange={handleScan} className="mt-1 text-xs file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-xs file:bg-amber-100 file:text-amber-800 file:cursor-pointer" data-testid="pdf-scan-file-input" disabled={scanning} />
+        <p className="text-xs text-amber-800 font-medium">Choose a Booking invoice PDF — nothing is saved yet</p>
+        {!selectedFile && <input ref={fileRef} type="file" accept=".pdf,application/pdf" onChange={handleScan} className="mt-1 text-xs file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-xs file:bg-amber-100 file:text-amber-800 file:cursor-pointer" data-testid="pdf-scan-file-input" disabled={scanning} />}
+        {selectedFile && (
+          <div className="mt-1 flex items-center justify-between gap-2">
+            <span className="text-xs text-stone-700 truncate">{selectedFile.name}</span>
+            <button type="button" onClick={onClear} className="text-xs font-medium text-rose-700 hover:underline">Remove</button>
+          </div>
+        )}
       </div>
       {scanning && <Loader2 className="w-4 h-4 animate-spin text-amber-600" />}
+      {scanResult?.ready_for_review && !scanning && <span className="text-xs font-semibold text-emerald-700">Ready to review</span>}
     </div>
   );
 };
 
-const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel, linked = false }) => {
+const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel, linked = false, importingPdf = false, showPdfFields = importingPdf, scanResult = null }) => {
   const finalBalance = (parseFloat(formData.total_price) || 0) - (parseFloat(formData.deposit_amount) || 0) - (parseFloat(formData.interim_payment) || 0);
   return (
     <form onSubmit={onSubmit} className="space-y-3">
+      {showPdfFields && (
+        <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 space-y-2" data-testid="invoice-import-review">
+          <p className="text-sm font-semibold text-emerald-900">PDF read successfully — review before saving</p>
+          <p className="text-xs text-emerald-800">The original PDF and its printed invoice number will be retained. You remain in control of every field below.</p>
+          {(scanResult?.warnings || []).map((warning, index) => <p key={index} className="text-xs text-amber-800">• {warning}</p>)}
+        </div>
+      )}
+      {importingPdf && (
+        <div className="grid grid-cols-2 gap-3">
+          <div className="space-y-2">
+            <Label>Invoice Number *</Label>
+            <Input value={formData.invoice_number} onChange={(e) => setFormData({ ...formData, invoice_number: e.target.value.toUpperCase() })} required className="border-stone-200 font-mono" data-testid="invoice-number-input" />
+          </div>
+          <div className="space-y-2">
+            <Label>Issue Date</Label>
+            <Input type="date" value={formData.issue_date} onChange={(e) => setFormData({ ...formData, issue_date: e.target.value })} className="border-stone-200" data-testid="invoice-issue-date-input" />
+          </div>
+        </div>
+      )}
       {/* Client Details */}
       <div className="space-y-2">
         <Label>Couple Names *</Label>
@@ -167,13 +198,18 @@ const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel, linked = fa
             </div>
           </div>
           <p className="text-xs text-stone-400 mt-1">Set the date when the remaining balance was paid. Leave blank if unpaid.</p>
+          <div className="space-y-1 mt-3">
+            <Label className="text-xs">Final Balance Due Date</Label>
+            <Input type="date" value={formData.final_payment_due} onChange={(e) => setFormData({ ...formData, final_payment_due: e.target.value })} className="border-stone-200" data-testid="final-due-date-input" />
+            <p className="text-xs text-stone-400">The PDF date is used when importing; otherwise Accounts calculates 45 days before the wedding.</p>
+          </div>
         </div>
       </div>
 
       {/* Notes */}
       <div className="space-y-2">
         <Label>Package Details / Notes</Label>
-        <Textarea value={formData.notes} onChange={(e) => setFormData({ ...formData, notes: e.target.value })} placeholder="What's included..." rows={3} className="border-stone-200" data-testid="notes-input" />
+        <Textarea value={formData.notes} onChange={(e) => setFormData({ ...formData, notes: e.target.value })} placeholder="What's included..." rows={showPdfFields ? 12 : 3} className="border-stone-200" data-testid="notes-input" />
       </div>
       {linked ? (
         <div className="py-2 px-3 bg-teal-50 border border-teal-100 rounded text-xs text-teal-800">
@@ -227,8 +263,10 @@ export const Invoices = () => {
   const [filterTaxYear, setFilterTaxYear] = useState("all");
   const [searchName, setSearchName] = useState("");
   const [sortAlpha, setSortAlpha] = useState(false);
-  const emptyForm = { couple_names: "", client_address: "", client_email: "", client_phone: "", wedding_date: "", venue: "", total_price: "", deposit_amount: "", deposit_paid_date: "", interim_payment: "", interim_payment_date: "", final_payment_paid_date: "", package_name: "", notes: "", include_in_totals: false };
+  const emptyForm = { invoice_number: "", issue_date: "", couple_names: "", client_address: "", client_email: "", client_phone: "", wedding_date: "", venue: "", total_price: "", deposit_amount: "", deposit_paid_date: "", interim_payment: "", interim_payment_date: "", final_payment_paid_date: "", final_payment_due: "", package_name: "", notes: "", line_items: [], include_in_totals: false };
   const [formData, setFormData] = useState(emptyForm);
+  const [sourcePdf, setSourcePdf] = useState(null);
+  const [scanResult, setScanResult] = useState(null);
   const [submitting, setSubmitting] = useState(false);
 
   const fetchInvoices = useCallback(async () => {
@@ -247,6 +285,8 @@ export const Invoices = () => {
     setEditInvoice(inv);
     setEmergencyReason("");
     setFormData({
+      invoice_number: inv.invoice_number || "",
+      issue_date: toISO(inv.issue_date || ""),
       couple_names: inv.couple_names || inv.client_name || "",
       client_address: inv.client_address || "",
       client_email: inv.client_email || "",
@@ -259,13 +299,17 @@ export const Invoices = () => {
       interim_payment: String(inv.interim_payment || ""),
       interim_payment_date: toISO(inv.interim_payment_date || ""),
       final_payment_paid_date: toISO(inv.final_payment_paid_date || ""),
+      final_payment_due: toISO(inv.final_payment_due || ""),
       package_name: inv.package_name || "",
       notes: inv.notes || "",
+      line_items: inv.line_items || [],
       include_in_totals: inv.include_in_totals || false,
     });
   };
 
   const buildPayload = () => ({
+    invoice_number: formData.invoice_number || null,
+    issue_date: formData.issue_date ? toUK(formData.issue_date) : null,
     couple_names: formData.couple_names,
     client_address: formData.client_address || null,
     client_email: formData.client_email || null,
@@ -278,8 +322,10 @@ export const Invoices = () => {
     interim_payment: parseFloat(formData.interim_payment) || 0,
     interim_payment_date: formData.interim_payment_date ? toUK(formData.interim_payment_date) : null,
     final_payment_paid_date: formData.final_payment_paid_date ? toUK(formData.final_payment_paid_date) : null,
+    final_payment_due: formData.final_payment_due ? toUK(formData.final_payment_due) : null,
     package_name: formData.package_name || null,
     notes: formData.notes || null,
+    line_items: formData.line_items || [],
     include_in_totals: formData.include_in_totals,
   });
 
@@ -287,12 +333,22 @@ export const Invoices = () => {
     e.preventDefault();
     setSubmitting(true);
     try {
-      await axios.post(`${API}/invoices`, buildPayload());
-      toast.success("Invoice created with PDF");
+      if (sourcePdf) {
+        const upload = new FormData();
+        upload.append("file", sourcePdf);
+        upload.append("invoice_json", JSON.stringify(buildPayload()));
+        await axios.post(`${API}/invoices/import-pdf`, upload);
+        toast.success(`${formData.invoice_number} imported — original PDF retained`);
+      } else {
+        await axios.post(`${API}/invoices`, buildPayload());
+        toast.success("Invoice created with PDF");
+      }
       setCreateOpen(false);
       setFormData(emptyForm);
+      setSourcePdf(null);
+      setScanResult(null);
       fetchInvoices();
-    } catch { toast.error("Failed to create invoice"); }
+    } catch (err) { toast.error(err?.response?.data?.detail || "Failed to create invoice"); }
     finally { setSubmitting(false); }
   };
 
@@ -311,7 +367,7 @@ export const Invoices = () => {
         ? `${API}/invoices/${editInvoice.id}/emergency-edit`
         : `${API}/invoices/${editInvoice.id}`;
       await axios.put(endpoint, linked ? { ...buildPayload(), reason: emergencyReason.trim() } : buildPayload());
-      toast.success(linked ? "Accounts copy updated and safely locked" : "Invoice updated & PDF regenerated");
+      toast.success(linked ? "Accounts copy updated and safely locked" : editInvoice.source_system === "manual_pdf_import" ? "Accounts details updated — original PDF preserved" : "Invoice updated & PDF regenerated");
       setEditInvoice(null);
       setEmergencyReason("");
       setFormData(emptyForm);
@@ -408,16 +464,43 @@ export const Invoices = () => {
               {TAX_YEARS.map((ty) => (<SelectItem key={ty.id} value={ty.id}>{ty.label}</SelectItem>))}
             </SelectContent>
           </Select>
-          <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+          <Dialog open={createOpen} onOpenChange={(open) => {
+            setCreateOpen(open);
+            if (!open) {
+              setFormData(emptyForm);
+              setSourcePdf(null);
+              setScanResult(null);
+            }
+          }}>
             <DialogTrigger asChild>
-              <Button className="bg-[#C7A76D] text-white hover:bg-[#B8985E] rounded-sm" data-testid="add-invoice-btn" onClick={() => setFormData(emptyForm)}>
+              <Button className="bg-[#C7A76D] text-white hover:bg-[#B8985E] rounded-sm" data-testid="add-invoice-btn" onClick={() => { setFormData(emptyForm); setSourcePdf(null); setScanResult(null); }}>
                 <Plus className="w-4 h-4 mr-2" />New Invoice
               </Button>
             </DialogTrigger>
-            <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto" data-testid="create-invoice-dialog">
-              <DialogHeader><DialogTitle style={{ fontFamily: 'Playfair Display, serif' }}>Create New Invoice</DialogTitle></DialogHeader>
-              <PdfScanUpload onScanned={(data) => setFormData(prev => ({ ...prev, ...data }))} />
-              <InvoiceForm formData={formData} setFormData={setFormData} onSubmit={handleCreate} submitLabel={submitting ? "Saving..." : "Create Invoice & Generate PDF"} />
+            <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto" data-testid="create-invoice-dialog">
+              <DialogHeader><DialogTitle style={{ fontFamily: 'Playfair Display, serif' }}>{sourcePdf ? "Review & Import Booking Invoice" : "Create New Invoice"}</DialogTitle></DialogHeader>
+              <PdfScanUpload
+                selectedFile={sourcePdf}
+                scanResult={scanResult}
+                onScanned={(data, file, result) => {
+                  setFormData(prev => ({ ...prev, ...data }));
+                  setSourcePdf(file);
+                  setScanResult(result);
+                }}
+                onClear={() => {
+                  setSourcePdf(null);
+                  setScanResult(null);
+                  setFormData(emptyForm);
+                }}
+              />
+              <InvoiceForm
+                formData={formData}
+                setFormData={setFormData}
+                onSubmit={handleCreate}
+                importingPdf={!!sourcePdf}
+                scanResult={scanResult}
+                submitLabel={submitting ? "Saving..." : sourcePdf ? `Import ${formData.invoice_number || "Reviewed Invoice"}` : "Create Invoice & Generate PDF"}
+              />
             </DialogContent>
           </Dialog>
         </div>
@@ -446,7 +529,7 @@ export const Invoices = () => {
               ) : (
                 filteredInvoices.map((inv) => (
                   <TableRow key={inv.id} className="border-stone-100" data-testid={`invoice-row-${inv.id}`}>
-                    <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}{inv.source_system === "booking_system" && <span className="block mt-1 text-[10px] font-sans text-teal-700">BOOKING LINKED</span>}{inv.legacy_invoice_number && inv.legacy_invoice_number !== inv.invoice_number && <span className="block mt-1 text-[10px] font-sans text-stone-500">Previous Studio Ninja: {inv.legacy_invoice_number}</span>}</TableCell>
+                    <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}{inv.source_system === "booking_system" && <span className="block mt-1 text-[10px] font-sans text-teal-700">BOOKING LINKED</span>}{inv.source_system === "manual_pdf_import" && <span className="block mt-1 text-[10px] font-sans text-amber-700">ORIGINAL PDF</span>}{inv.legacy_invoice_number && inv.legacy_invoice_number !== inv.invoice_number && <span className="block mt-1 text-[10px] font-sans text-stone-500">Previous Studio Ninja: {inv.legacy_invoice_number}</span>}</TableCell>
                     <TableCell className="font-medium">{getName(inv)}</TableCell>
                     <TableCell className="font-mono text-sm">{getDate(inv)}</TableCell>
                     <TableCell className="text-stone-500 text-sm max-w-[180px] truncate">{inv.package_name || (inv.notes ? inv.notes.substring(0, 30) : "-")}</TableCell>
@@ -538,7 +621,7 @@ export const Invoices = () => {
                   </div>
                 </div>
               )}
-              <InvoiceForm formData={formData} setFormData={setFormData} onSubmit={handleUpdate} linked={editInvoice.source_system === "booking_system"} submitLabel={submitting ? "Saving..." : editInvoice.source_system === "booking_system" ? "Save Accounts Override & Regenerate PDF" : "Save Changes & Regenerate PDF"} />
+              <InvoiceForm formData={formData} setFormData={setFormData} onSubmit={handleUpdate} linked={editInvoice.source_system === "booking_system"} showPdfFields={editInvoice.source_system === "manual_pdf_import"} submitLabel={submitting ? "Saving..." : editInvoice.source_system === "booking_system" ? "Save Accounts Override & Regenerate PDF" : editInvoice.source_system === "manual_pdf_import" ? "Save Details & Preserve Original PDF" : "Save Changes & Regenerate PDF"} />
             </>
           )}
         </DialogContent>
