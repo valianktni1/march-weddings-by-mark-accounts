@@ -61,6 +61,33 @@ def test_unlinked_manual_and_bank_expense_collision_blocks_close():
     assert result["validation"]["ready_to_close"] is False
 
 
+def test_personally_paid_manual_expense_does_not_false_match_same_day_bank_payment():
+    result = snapshot(
+        transactions=[{
+            "id": "tx-unrelated", "date": "17/06/2025", "description": "Unrelated supplier",
+            "amount": 80, "transaction_type": "expense", "category": "Other",
+            "tax_year": "2025-26", "excluded_from_totals": False,
+        }],
+        expenses=[{
+            "id": "expense-awards-hotel", "date": "17/06/2025",
+            "description": "Accommodation for County Brides Wedding Awards",
+            "amount": 80, "category": "Travel & Mileage", "tax_year": "2025-26",
+            "supplier": "Radisson Hotel", "paid_personally": True,
+            "file_name": "hotel-receipt.pdf",
+        }],
+    )
+
+    codes = {item["code"] for item in result["validation"]["checks"]}
+    assert "manual_bank_duplicates" not in codes
+    assert result["summary"]["bank_expenses"] == 80
+    assert result["summary"]["manual_expenses"] == 80
+    assert result["summary"]["allowable_expenses"] == 160
+    personal_row = next(row for row in result["expense_ledger"] if row["id"] == "expense-awards-hotel")
+    assert personal_row["included"] is True
+    assert personal_row["paid_personally"] is True
+    assert personal_row["expense_source"] == "manual expense paid personally"
+
+
 def test_booking_payments_reconcile_but_never_add_invoice_income_twice():
     result = snapshot(
         transactions=[{

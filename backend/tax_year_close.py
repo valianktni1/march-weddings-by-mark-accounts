@@ -295,11 +295,16 @@ def build_tax_snapshot(
             "supplier": str(expense.get("supplier") or ""),
             "amount": amount,
             "category": str(expense.get("category") or ""),
-            "expense_source": "bank-linked receipt" if linked_to_bank else "manual/cash expense",
+            "expense_source": (
+                "bank-linked receipt" if linked_to_bank
+                else "manual expense paid personally" if expense.get("paid_personally")
+                else "manual/cash expense"
+            ),
             "source": "manual expense",
             "included": included,
             "exclusion_reason": "Represented by the linked bank transaction" if linked_to_bank else ("Marked not included" if explicitly_excluded else ""),
             "source_transaction_id": str(expense.get("source_transaction_id") or ""),
+            "paid_personally": bool(expense.get("paid_personally")),
             "receipt_file": str(expense.get("file_name") or ""),
         }
         expense_ledger.append(row)
@@ -332,10 +337,12 @@ def build_tax_snapshot(
             bank_expense_keys[(iso_date(row["date"]), row["amount"])].append(row)
     possible_double_count = []
     for row in expense_ledger:
-        if row["source"] == "manual expense" and row["included"] and bank_expense_keys.get((iso_date(row["date"]), row["amount"])):
+        if (row["source"] == "manual expense" and row["included"]
+                and not row.get("paid_personally")
+                and bank_expense_keys.get((iso_date(row["date"]), row["amount"]))):
             possible_double_count.append(row)
     if possible_double_count:
-        checks.append(_issue("manual_bank_duplicates", "blocker", "Manual expenses may duplicate bank payments", possible_double_count, "Delete the duplicate manual record or link it to the bank transaction."))
+        checks.append(_issue("manual_bank_duplicates", "blocker", "Manual expenses may duplicate bank payments", possible_double_count, "Delete the duplicate manual record, link it to the bank transaction, or mark a genuine expense as paid personally."))
 
     missing_receipts = [row for row in expense_ledger if row["source"] == "manual expense" and row["included"] and not row.get("receipt_file")]
     if missing_receipts:

@@ -61,7 +61,7 @@ export const Expenses = () => {
   const [scanning, setScanning] = useState(false);
   const [formData, setFormData] = useState({
     description: "", amount: "", category: "", date: new Date().toISOString().split("T")[0],
-    tax_year: getCurrentTaxYear(), supplier: "", include_amount: true,
+    tax_year: getCurrentTaxYear(), supplier: "", include_amount: true, paid_personally: false,
   });
   const [file, setFile] = useState(null);
   const [submitting, setSubmitting] = useState(false);
@@ -73,6 +73,7 @@ export const Expenses = () => {
   const [editSupplier, setEditSupplier] = useState("");
   const [editCategory, setEditCategory] = useState("");
   const [editExcluded, setEditExcluded] = useState(false);
+  const [editPaidPersonally, setEditPaidPersonally] = useState(false);
   const [savingEdit, setSavingEdit] = useState(false);
 
   const fetchExpenses = useCallback(async () => {
@@ -136,6 +137,7 @@ export const Expenses = () => {
       fd.append("date", fromInputDate(formData.date));
       fd.append("tax_year", formData.tax_year);
       fd.append("include_amount", formData.include_amount.toString());
+      fd.append("paid_personally", formData.paid_personally.toString());
       if (formData.supplier) fd.append("supplier", formData.supplier);
 
       if (file) {
@@ -148,7 +150,7 @@ export const Expenses = () => {
       }
       toast.success("Expense added");
       setDialogOpen(false);
-      setFormData({ description: "", amount: "", category: "", date: new Date().toISOString().split("T")[0], tax_year: getCurrentTaxYear(), supplier: "", include_amount: true });
+      setFormData({ description: "", amount: "", category: "", date: new Date().toISOString().split("T")[0], tax_year: getCurrentTaxYear(), supplier: "", include_amount: true, paid_personally: false });
       setFile(null);
       fetchExpenses();
     } catch { toast.error("Failed to add expense"); }
@@ -169,6 +171,7 @@ export const Expenses = () => {
     setEditSupplier(expense.supplier || "");
     setEditCategory(expense.category || "");
     setEditExcluded(Boolean(expense.excluded_from_totals));
+    setEditPaidPersonally(Boolean(expense.paid_personally));
   };
 
   const saveExpenseEdit = async () => {
@@ -191,6 +194,7 @@ export const Expenses = () => {
           supplier: editSupplier || null,
           category: editCategory,
           include_in_totals: !editExcluded,
+          paid_personally: editPaidPersonally,
         });
       }
       toast.success("Expense updated — totals now use the corrected category");
@@ -325,6 +329,10 @@ export const Expenses = () => {
                   <Checkbox id="include_amount" checked={formData.include_amount} onCheckedChange={(checked) => setFormData({ ...formData, include_amount: !!checked })} data-testid="include-amount-checkbox" />
                   <Label htmlFor="include_amount" className="text-sm text-stone-600 cursor-pointer">Include amount in expense totals</Label>
                 </div>
+                <label className="flex cursor-pointer items-start gap-3 rounded-sm border border-stone-200 p-3 text-sm">
+                  <Checkbox checked={formData.paid_personally} onCheckedChange={(checked) => setFormData({ ...formData, paid_personally: checked === true })} data-testid="paid-personally-checkbox" className="mt-0.5" />
+                  <span><strong className="block text-stone-800">Paid personally / personal credit card</strong><span className="text-stone-500">Use when this genuine business expense will not appear in the business bank account.</span></span>
+                </label>
                 <Button type="submit" disabled={submitting} className="w-full bg-[#C7A76D] hover:bg-[#B8985E] text-white rounded-sm" data-testid="submit-expense-btn">
                   {submitting ? "Adding..." : file ? "Add Expense & Store Receipt" : "Add Expense"}
                 </Button>
@@ -486,7 +494,7 @@ export const Expenses = () => {
                 filteredExpenses.map((exp) => (
                   <TableRow key={`${exp.source}-${exp.id}`} className={`border-stone-100 ${exp.excluded_from_totals ? "opacity-60" : ""}`} data-testid={`expense-row-${exp.source}-${exp.id}`}>
                     <TableCell className="font-mono text-sm">{formatDateUK(exp.date)}</TableCell>
-                    <TableCell className="font-medium min-w-52 max-w-md"><div className="truncate">{exp.description}</div>{exp.supplier && <div className="text-xs font-normal text-stone-400 truncate">{exp.supplier}</div>}{exp.excluded_from_totals && <div className="text-xs font-normal text-stone-400">Excluded from totals</div>}</TableCell>
+                    <TableCell className="font-medium min-w-52 max-w-md"><div className="truncate">{exp.description}</div>{exp.supplier && <div className="text-xs font-normal text-stone-400 truncate">{exp.supplier}</div>}{exp.paid_personally && <div className="text-xs font-normal text-emerald-700">Paid personally</div>}{exp.excluded_from_totals && <div className="text-xs font-normal text-stone-400">Excluded from totals</div>}</TableCell>
                     <TableCell><span className={`inline-flex items-center gap-1 text-xs px-2 py-1 rounded-sm whitespace-nowrap ${exp.source === "bank" ? "bg-sky-50 text-sky-700" : "bg-amber-50 text-amber-700"}`}>{exp.source === "bank" ? <Landmark className="w-3 h-3" /> : <FilePlus2 className="w-3 h-3" />}{exp.source_label}</span></TableCell>
                     <TableCell>{exp.category ? <span className="text-xs px-2 py-1 bg-rose-50 text-rose-700 rounded-sm whitespace-nowrap">{exp.category}</span> : <span className="text-xs px-2 py-1 bg-amber-100 text-amber-800 font-semibold rounded-sm whitespace-nowrap">Needs category</span>}</TableCell>
                     <TableCell><span className="text-xs px-2 py-1 bg-stone-100 rounded-sm">{TAX_YEARS.find(t => t.id === exp.tax_year)?.label || exp.tax_year}</span></TableCell>
@@ -527,6 +535,7 @@ export const Expenses = () => {
             </>}
             <div className="space-y-2"><Label>Expense category</Label><Select value={editCategory} onValueChange={setEditCategory} disabled={editExcluded}><SelectTrigger><SelectValue placeholder="Choose the correct category" /></SelectTrigger><SelectContent>{EXPENSE_CATEGORIES.map((category) => <SelectItem key={category} value={category}>{category}</SelectItem>)}</SelectContent></Select></div>
             <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-stone-200 p-3 text-sm"><Checkbox checked={editExcluded} onCheckedChange={(value) => setEditExcluded(value === true)} className="mt-0.5" /><span><strong className="block text-stone-800">Exclude from tax totals</strong><span className="text-stone-500">{editExpense.source === "bank" ? "Use only when this bank payment is personal, a transfer, or otherwise not an allowable business expense." : "Imported records awaiting review remain excluded until you confirm they are genuine independent expenses."}</span></span></label>
+            {editExpense.source === "manual" && <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50/50 p-3 text-sm"><Checkbox checked={editPaidPersonally} onCheckedChange={(value) => setEditPaidPersonally(value === true)} className="mt-0.5" data-testid="edit-paid-personally-checkbox" /><span><strong className="block text-stone-800">Paid personally / personal credit card</strong><span className="text-stone-500">Keeps this genuine business expense in the tax totals without trying to match it to a business-bank payment.</span></span></label>}
             <p className="text-xs text-stone-500">{editExpense.source === "bank" ? "This updates the original bank transaction, so the dashboard and Tax Year Close use the corrected category without creating a duplicate expense." : "This updates the manual expense record."}</p>
             <Button onClick={saveExpenseEdit} disabled={savingEdit || !editDescription.trim() || (!editExcluded && !editCategory)} className="w-full bg-[#C7A76D] hover:bg-[#B8985E] text-white">{savingEdit ? "Saving..." : "Save expense"}</Button>
           </div>}

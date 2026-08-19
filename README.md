@@ -6,6 +6,7 @@ Independent, self-hosted accounts manager for Weddings By Mark. This is a secure
 
 - Invoices and payment tracking
 - Expenses, receipts and recurring expenses
+- Personally paid business expenses that stay in tax totals without false bank-duplicate blocks
 - Mileage calculations
 - Tide CSV and optional direct Gemini bank-statement parsing
 - Bank transactions and UK tax-year summaries

@@ -120,3 +120,22 @@ def test_unified_expense_ledger_respects_manual_review_exclusion():
     assert rows[0]["amount"] == 45
     assert rows[0]["included_in_totals"] is False
     assert rows[0]["excluded_from_totals"] is True
+
+
+def test_unified_expense_ledger_marks_personally_paid_manual_expense():
+    rows = server.build_expense_ledger_rows(
+        [],
+        [{
+            "id": "manual-personal-card",
+            "date": "17/06/2026",
+            "description": "Awards accommodation",
+            "amount": 80,
+            "category": "Travel & Mileage",
+            "tax_year": "2026-27",
+            "paid_personally": True,
+        }],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["included_in_totals"] is True
+    assert rows[0]["paid_personally"] is True

@@ -53,7 +53,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.19-accounts-renumbered-pdf-import-v1.4.7"
+BUILD_ID = "2026.08.19-paid-personally-expenses-v1.4.8"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -189,6 +189,7 @@ class Expense(BaseModel):
     file_path: Optional[str] = None
     file_name: Optional[str] = None
     is_from_bank: bool = False
+    paid_personally: bool = False
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -200,6 +201,7 @@ class ExpenseCreate(BaseModel):
     tax_year: str
     supplier: Optional[str] = None
     include_amount: bool = True
+    paid_personally: bool = False
 
 
 class ExpenseUpdate(BaseModel):
@@ -207,6 +209,7 @@ class ExpenseUpdate(BaseModel):
     category: str = Field(min_length=1, max_length=160)
     supplier: Optional[str] = Field(default=None, max_length=200)
     include_in_totals: Optional[bool] = None
+    paid_personally: Optional[bool] = None
 
 
 class Transaction(BaseModel):
@@ -421,6 +424,7 @@ def build_expense_ledger_rows(
                 "excluded_from_totals": not included_in_totals,
                 "has_receipt": bool(expense.get("file_path")),
                 "receipt_expense_id": expense_id if expense.get("file_path") else None,
+                "paid_personally": bool(expense.get("paid_personally")),
                 "created_at": expense.get("created_at"),
             }
         )
@@ -3124,7 +3128,8 @@ async def upload_expense(
     date: str = Form(...),
     tax_year: str = Form(...),
     supplier: Optional[str] = Form(None),
-    include_amount: bool = Form(True)
+    include_amount: bool = Form(True),
+    paid_personally: bool = Form(False),
 ):
     await _assert_tax_year_open(tax_year)
     # Save file
@@ -3145,6 +3150,7 @@ async def upload_expense(
         date=format_date_uk(date),
         tax_year=tax_year,
         supplier=supplier,
+        paid_personally=paid_personally,
         file_path=str(file_path),
         file_name=original_name
     )
@@ -3194,6 +3200,8 @@ async def update_expense(expense_id: str, payload: ExpenseUpdate):
     }
     if payload.include_in_totals is not None:
         updates["include_in_totals"] = payload.include_in_totals
+    if payload.paid_personally is not None:
+        updates["paid_personally"] = payload.paid_personally
     await db.expenses.update_one({"id": expense_id}, {"$set": updates})
     return await db.expenses.find_one({"id": expense_id}, {"_id": 0})
 
