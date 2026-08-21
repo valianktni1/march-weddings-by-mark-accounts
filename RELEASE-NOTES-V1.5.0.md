@@ -1,4 +1,4 @@
-# Accounts V1.5.0 — Cash-flow and Navigation
+# Accounts V1.5.0.1 — Cash-flow, Navigation and Round-trip Mileage
 
 ## Cash-flow forecast
 
@@ -34,7 +34,8 @@
 - Cash-flow commitments are included in complete backups and restores.
 - Booking-system integration remains disabled.
 - No manual database migration is required; the new planning index is created safely at startup.
+- V1.5.0.1 corrects a missing Dashboard icon import that could leave a blank screen immediately after sign-in. No accounting data was affected.
 
 ## Build
 
-`2026.08.21-cash-flow-navigation-round-trip-v1.5.0`
+`2026.08.21-cash-flow-navigation-round-trip-v1.5.0.1`

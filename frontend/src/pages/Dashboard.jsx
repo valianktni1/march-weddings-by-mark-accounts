@@ -16,6 +16,7 @@ import {
   Upload,
   RefreshCw,
   HardDrive,
+  Building2,
   CalendarClock,
   Clock3,
   ChevronRight

@@ -1,4 +1,4 @@
-ACCOUNTS V1.5.0 - TRUENAS DEPLOYMENT
+ACCOUNTS V1.5.0.1 - TRUENAS DEPLOYMENT
 ====================================
 
 1. Extract this release and upload its complete contents to the main branch of:
@@ -16,7 +16,7 @@ curl -fsS http://127.0.0.1:30053/api/health
 echo
 
 Expected build:
-2026.08.21-cash-flow-navigation-round-trip-v1.5.0
+2026.08.21-cash-flow-navigation-round-trip-v1.5.0.1
 
 AFTER DEPLOYMENT
 ----------------
