@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { toast } from "sonner";
 import { Card, CardContent } from "@/components/ui/card";
@@ -13,7 +14,7 @@ import { Switch } from "@/components/ui/switch";
 import { Plus, Trash2, Eye, Pencil, Upload, Loader2, Ban, RotateCcw, ShieldAlert, History } from "lucide-react";
 import { formatCurrency } from "@/utils/formatters";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
 const TAX_YEARS = [
   { id: "2022-23", label: "2022/23" }, { id: "2023-24", label: "2023/24" }, { id: "2024-25", label: "2024/25" },
@@ -258,6 +259,7 @@ const InvoiceForm = ({ formData, setFormData, onSubmit, submitLabel, linked = fa
 };
 
 export const Invoices = () => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [invoices, setInvoices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
@@ -269,9 +271,9 @@ export const Invoices = () => {
   const [auditInvoice, setAuditInvoice] = useState(null);
   const [auditLogs, setAuditLogs] = useState([]);
   const [auditLoading, setAuditLoading] = useState(false);
-  const [filterTaxYear, setFilterTaxYear] = useState("all");
-  const [searchName, setSearchName] = useState("");
-  const [sortAlpha, setSortAlpha] = useState(false);
+  const [filterTaxYear, setFilterTaxYear] = useState(searchParams.get("taxYear") || "all");
+  const [searchName, setSearchName] = useState(searchParams.get("search") || "");
+  const [sortAlpha, setSortAlpha] = useState(searchParams.get("sort") === "az");
   const emptyForm = { invoice_number: "", issue_date: "", couple_names: "", client_address: "", client_email: "", client_phone: "", wedding_date: "", venue: "", total_price: "", deposit_amount: "", deposit_paid_date: "", interim_payment: "", interim_payment_date: "", final_payment_paid_date: "", final_payment_due: "", package_name: "", notes: "", line_items: [], include_in_totals: false };
   const [formData, setFormData] = useState(emptyForm);
   const [sourcePdf, setSourcePdf] = useState(null);
@@ -289,6 +291,31 @@ export const Invoices = () => {
   }, [filterTaxYear]);
 
   useEffect(() => { fetchInvoices(); }, [fetchInvoices]);
+
+  useEffect(() => {
+    if (searchParams.get("action") === "new") setCreateOpen(true);
+  }, [searchParams]);
+
+  useEffect(() => {
+    const requestedSearch = searchParams.get("search") || "";
+    const requestedYear = searchParams.get("taxYear") || "all";
+    const requestedSort = searchParams.get("sort") === "az";
+    if (requestedSearch !== searchName) setSearchName(requestedSearch);
+    if (requestedYear !== filterTaxYear) setFilterTaxYear(requestedYear);
+    if (requestedSort !== sortAlpha) setSortAlpha(requestedSort);
+    // Browser history can replace all three values at once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    searchName ? next.set("search", searchName) : next.delete("search");
+    filterTaxYear !== "all" ? next.set("taxYear", filterTaxYear) : next.delete("taxYear");
+    sortAlpha ? next.set("sort", "az") : next.delete("sort");
+    setSearchParams(next, { replace: true });
+    // The URL deliberately mirrors the current filters for browser Back/Forward and refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchName, filterTaxYear, sortAlpha]);
 
   const openEdit = (inv) => {
     setEditInvoice(inv);
@@ -479,6 +506,9 @@ export const Invoices = () => {
               setFormData(emptyForm);
               setSourcePdf(null);
               setScanResult(null);
+              const next = new URLSearchParams(searchParams);
+              next.delete("action");
+              setSearchParams(next, { replace: true });
             }
           }}>
             <DialogTrigger asChild>
@@ -537,7 +567,7 @@ export const Invoices = () => {
                 <TableRow><TableCell colSpan={8} className="text-center py-8 text-stone-400">No invoices found.</TableCell></TableRow>
               ) : (
                 filteredInvoices.map((inv) => (
-                  <TableRow key={inv.id} className="border-stone-100" data-testid={`invoice-row-${inv.id}`}>
+                  <TableRow key={inv.id} className={`border-stone-100 ${searchParams.get("focus") === inv.id ? "bg-[#C7A76D]/10" : ""}`} data-testid={`invoice-row-${inv.id}`}>
                     <TableCell className="font-mono text-sm text-[#C7A76D]">{inv.invoice_number || "-"}{inv.source_system === "booking_system" && <span className="block mt-1 text-[10px] font-sans text-teal-700">BOOKING LINKED</span>}{inv.source_system === "manual_pdf_import" && <span className="block mt-1 text-[10px] font-sans text-stone-500">ACCOUNTS COPY</span>}{inv.legacy_invoice_number && inv.legacy_invoice_number !== inv.invoice_number && <span className="block mt-1 text-[10px] font-sans text-stone-500">Previous Studio Ninja: {inv.legacy_invoice_number}</span>}</TableCell>
                     <TableCell className="font-medium">{getName(inv)}</TableCell>
                     <TableCell className="font-mono text-sm">{getDate(inv)}</TableCell>

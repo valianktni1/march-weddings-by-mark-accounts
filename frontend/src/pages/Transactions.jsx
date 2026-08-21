@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -12,7 +13,7 @@ import { ArrowLeftRight, TrendingUp, TrendingDown, Ban, Building2, Search, Recei
 import { Checkbox } from "@/components/ui/checkbox";
 import { formatCurrency, formatDateUK, getCurrentTaxYear } from "@/utils/formatters";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
 const TAX_YEARS = [
   { id: "2023-24", label: "2023/24" },
@@ -41,12 +42,13 @@ function parseUKDate(dateStr) {
 }
 
 export const Transactions = () => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [transactions, setTransactions] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [filterTaxYear, setFilterTaxYear] = useState("all");
-  const [filterType, setFilterType] = useState("all");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [sortOrder, setSortOrder] = useState("newest");
+  const [filterTaxYear, setFilterTaxYear] = useState(searchParams.get("taxYear") || "all");
+  const [filterType, setFilterType] = useState(searchParams.get("type") || "all");
+  const [searchQuery, setSearchQuery] = useState(searchParams.get("search") || "");
+  const [sortOrder, setSortOrder] = useState(searchParams.get("sort") || "newest");
   const [quickExpense, setQuickExpense] = useState(null);
   const [quickCategory, setQuickCategory] = useState("");
   const [quickSupplier, setQuickSupplier] = useState("");
@@ -75,6 +77,30 @@ export const Transactions = () => {
   useEffect(() => {
     fetchTransactions();
   }, [fetchTransactions]);
+
+  useEffect(() => {
+    const values = {
+      search: searchParams.get("search") || "",
+      year: searchParams.get("taxYear") || "all",
+      type: searchParams.get("type") || "all",
+      sort: searchParams.get("sort") || "newest",
+    };
+    if (values.search !== searchQuery) setSearchQuery(values.search);
+    if (values.year !== filterTaxYear) setFilterTaxYear(values.year);
+    if (values.type !== filterType) setFilterType(values.type);
+    if (values.sort !== sortOrder) setSortOrder(values.sort);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    searchQuery ? next.set("search", searchQuery) : next.delete("search");
+    filterTaxYear !== "all" ? next.set("taxYear", filterTaxYear) : next.delete("taxYear");
+    filterType !== "all" ? next.set("type", filterType) : next.delete("type");
+    sortOrder !== "newest" ? next.set("sort", sortOrder) : next.delete("sort");
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, filterTaxYear, filterType, sortOrder]);
 
   const handleQuickExpense = async () => {
     if (!quickExpense || !quickCategory) return;
@@ -321,7 +347,7 @@ export const Transactions = () => {
                   return (
                     <TableRow 
                       key={tx.id} 
-                      className={`border-stone-100 ${tx.excluded_from_totals ? 'opacity-60' : ''}`}
+                      className={`border-stone-100 ${tx.excluded_from_totals ? 'opacity-60' : ''} ${searchParams.get("focus") === tx.id ? "bg-[#C7A76D]/10" : ""}`}
                       data-testid={`transaction-row-${tx.id}`}
                     >
                       <TableCell className="font-mono text-sm">{formatDateUK(tx.date)}</TableCell>

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -14,12 +15,15 @@ import {
   Download,
   Upload,
   RefreshCw,
-  HardDrive
+  HardDrive,
+  CalendarClock,
+  Clock3,
+  ChevronRight
 } from "lucide-react";
 import { formatCurrency, getCurrentTaxYear } from "@/utils/formatters";
 import { OverdueAlerts, MonthlyChart, CategoryChart, ComparisonCard } from "./DashboardCharts";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
 const TAX_YEARS = [
   { id: "2023-24", label: "2023/24" },
@@ -32,13 +36,17 @@ const TAX_YEARS = [
 ];
 
 export const Dashboard = () => {
-  const [taxYear, setTaxYear] = useState(getCurrentTaxYear());
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [taxYear, setTaxYear] = useState(searchParams.get("taxYear") || getCurrentTaxYear());
   const [summary, setSummary] = useState(null);
   const [extras, setExtras] = useState(null);
   const [comparison, setComparison] = useState(null);
   const [loading, setLoading] = useState(true);
   const [backupLoading, setBackupLoading] = useState(false);
   const [restoreLoading, setRestoreLoading] = useState(false);
+  const [recent, setRecent] = useState([]);
+  const [cashPreview, setCashPreview] = useState(null);
 
   const getPrevTaxYear = (ty) => {
     try {
@@ -75,6 +83,24 @@ export const Dashboard = () => {
   useEffect(() => {
     fetchSummary();
   }, [fetchSummary]);
+
+  useEffect(() => {
+    const requestedYear = searchParams.get("taxYear") || getCurrentTaxYear();
+    if (requestedYear !== taxYear) setTaxYear(requestedYear);
+  }, [searchParams, taxYear]);
+
+  useEffect(() => {
+    Promise.all([axios.get(`${API}/recent-records?limit=6`), axios.get(`${API}/cash-flow?horizon_days=30`)])
+      .then(([recentRes, cashRes]) => { setRecent(recentRes.data); setCashPreview(cashRes.data); })
+      .catch(() => { /* The main dashboard remains usable if a preview fails. */ });
+  }, []);
+
+  const changeTaxYear = (value) => {
+    setTaxYear(value);
+    const next = new URLSearchParams(searchParams);
+    next.set("taxYear", value);
+    setSearchParams(next, { replace: true });
+  };
 
   const handleBackup = async () => {
     setBackupLoading(true);
@@ -128,7 +154,7 @@ export const Dashboard = () => {
         {/* Tax Year Selector */}
         <div className="flex items-center gap-3">
           <span className="text-sm text-stone-500">Tax Year:</span>
-          <Select value={taxYear} onValueChange={setTaxYear} data-testid="tax-year-selector">
+          <Select value={taxYear} onValueChange={changeTaxYear} data-testid="tax-year-selector">
             <SelectTrigger className="w-36 bg-white border-stone-200" data-testid="tax-year-trigger">
               <SelectValue />
             </SelectTrigger>
@@ -141,6 +167,31 @@ export const Dashboard = () => {
             </SelectContent>
           </Select>
         </div>
+      </div>
+
+      {/* Daily shortcuts and recently touched records */}
+      <div className="grid gap-6 lg:grid-cols-[0.9fr_1.1fr]">
+        <Card className="border-stone-100 bg-white card-shadow" data-testid="quick-actions-card">
+          <CardHeader><CardTitle className="text-lg font-medium text-stone-800">Quick actions</CardTitle><p className="text-xs text-stone-500">Start the jobs you use most often.</p></CardHeader>
+          <CardContent className="grid grid-cols-2 gap-3">
+            {[
+              { label: "New invoice", path: "/invoices?action=new", icon: FileText },
+              { label: "New expense", path: "/expenses?action=new", icon: Receipt },
+              { label: "Plan outgoing", path: "/cash-flow?action=new", icon: CalendarClock },
+              { label: "Import statement", path: "/bank-statements", icon: Building2 },
+            ].map((action) => <button key={action.label} onClick={() => navigate(action.path)} className="flex items-center gap-3 rounded-lg border border-stone-200 p-3 text-left text-sm font-semibold text-stone-700 transition hover:border-[#C7A76D] hover:bg-[#C7A76D]/5"><span className="flex h-9 w-9 items-center justify-center rounded-md bg-[#C7A76D]/10 text-[#9A7B43]"><action.icon className="h-4 w-4" /></span>{action.label}</button>)}
+            <button onClick={() => navigate("/cash-flow")} className="col-span-2 flex items-center justify-between rounded-lg bg-stone-900 p-4 text-left text-white">
+              <span><span className="block text-xs text-stone-300">Next 30 days</span><span className="mt-0.5 block font-mono text-xl font-semibold">{formatCurrency(cashPreview?.totals?.net)}</span><span className="text-xs text-stone-300">expected net movement</span></span><ChevronRight className="h-5 w-5" />
+            </button>
+          </CardContent>
+        </Card>
+
+        <Card className="border-stone-100 bg-white card-shadow" data-testid="recent-records-card">
+          <CardHeader><CardTitle className="flex items-center gap-2 text-lg font-medium text-stone-800"><Clock3 className="h-5 w-5 text-[#C7A76D]" />Recent records</CardTitle><p className="text-xs text-stone-500">Jump straight back into something you recently changed.</p></CardHeader>
+          <CardContent>
+            {recent.length === 0 ? <p className="py-8 text-center text-sm text-stone-500">No recent records yet.</p> : <div className="divide-y divide-stone-100">{recent.map((item) => <button key={`${item.type}-${item.id}`} onClick={() => navigate(item.path)} className="flex w-full items-center gap-3 py-3 text-left hover:bg-stone-50"><span className="rounded bg-stone-100 px-2 py-1 text-[10px] font-bold uppercase text-stone-500">{item.type}</span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold text-stone-800">{item.title}</span><span className="block truncate text-xs text-stone-500">{item.subtitle}</span></span><span className="font-mono text-sm text-stone-600">{formatCurrency(item.amount)}</span><ChevronRight className="h-4 w-4 text-stone-300" /></button>)}</div>}
+          </CardContent>
+        </Card>
       </div>
 
       {/* Summary Cards - Bento Grid */}

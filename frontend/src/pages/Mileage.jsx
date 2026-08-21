@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -7,11 +8,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Plus, Trash2, Car } from "lucide-react";
+import { Plus, Trash2, Car, Search } from "lucide-react";
 import { formatCurrency, getCurrentTaxYear } from "@/utils/formatters";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
 const TAX_YEARS = [
   { id: "2023-24", label: "2023/24" }, { id: "2024-25", label: "2024/25" },
@@ -20,10 +22,12 @@ const TAX_YEARS = [
 ];
 
 const Mileage = () => {
-  const [taxYear, setTaxYear] = useState(getCurrentTaxYear());
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [taxYear, setTaxYear] = useState(searchParams.get("taxYear") || getCurrentTaxYear());
+  const [searchQuery, setSearchQuery] = useState(searchParams.get("search") || "");
   const [data, setData] = useState({ entries: [], total_miles: 0, total_amount: 0 });
   const [open, setOpen] = useState(false);
-  const [form, setForm] = useState({ date: "", description: "", from_location: "", to_location: "", miles: "" });
+  const [form, setForm] = useState({ date: "", description: "", from_location: "", to_location: "", miles: "", round_trip: false });
 
   const fetchMileage = useCallback(async () => {
     try {
@@ -34,12 +38,38 @@ const Mileage = () => {
 
   useEffect(() => { fetchMileage(); }, [fetchMileage]);
 
+  useEffect(() => {
+    if (searchParams.get("action") === "new") setOpen(true);
+  }, [searchParams]);
+
+  useEffect(() => {
+    const requestedYear = searchParams.get("taxYear") || getCurrentTaxYear();
+    const requestedSearch = searchParams.get("search") || "";
+    if (requestedYear !== taxYear) setTaxYear(requestedYear);
+    if (requestedSearch !== searchQuery) setSearchQuery(requestedSearch);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    next.set("taxYear", taxYear);
+    searchQuery ? next.set("search", searchQuery) : next.delete("search");
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taxYear, searchQuery]);
+
+  const visibleEntries = data.entries.filter((entry) => {
+    const needle = searchQuery.trim().toLowerCase();
+    if (!needle) return true;
+    return [entry.description, entry.from_location, entry.to_location].some((value) => String(value || "").toLowerCase().includes(needle));
+  });
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
       await axios.post(`${API}/mileage`, { ...form, miles: parseFloat(form.miles), tax_year: taxYear });
-      toast.success("Mileage entry added");
-      setForm({ date: "", description: "", from_location: "", to_location: "", miles: "" });
+      toast.success(form.round_trip ? "Round-trip mileage added" : "Mileage entry added");
+      setForm({ date: "", description: "", from_location: "", to_location: "", miles: "", round_trip: false });
       setOpen(false);
       fetchMileage();
     } catch { toast.error("Failed to add mileage"); }
@@ -94,12 +124,16 @@ const Mileage = () => {
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label>Miles (round trip) *</Label>
+                  <Label>{form.round_trip ? "Miles (one way) *" : "Miles travelled *"}</Label>
                   <Input type="number" step="0.1" value={form.miles} onChange={e => setForm({...form, miles: e.target.value})} required className="border-stone-200 font-mono" data-testid="mileage-miles" />
                 </div>
+                <label className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition ${form.round_trip ? "border-[#C7A76D] bg-[#C7A76D]/10" : "border-stone-200 bg-white"}`}>
+                  <Checkbox checked={form.round_trip} onCheckedChange={(checked) => setForm({ ...form, round_trip: checked === true })} data-testid="mileage-round-trip" />
+                  <span><span className="block text-sm font-semibold text-stone-800">Round trip - double this mileage</span><span className="block text-xs text-stone-500">Use for a straightforward journey to the wedding and back with no other venues.</span></span>
+                </label>
                 <div className="bg-stone-50 rounded p-3 text-sm">
                   <p className="text-stone-500">HMRC Rate: <span className="font-mono">{taxYear >= "2026-27" ? "55p" : "45p"}/mile</span> (first 10,000) then <span className="font-mono">25p/mile</span></p>
-                  {form.miles && <p className="text-stone-700 mt-1">Estimated claim: <span className="font-mono font-medium">{formatCurrency(parseFloat(form.miles || 0) * (taxYear >= "2026-27" ? 0.55 : 0.45))}</span></p>}
+                  {form.miles && <><p className="text-stone-700 mt-1">Mileage recorded: <span className="font-mono font-medium">{(parseFloat(form.miles || 0) * (form.round_trip ? 2 : 1)).toFixed(1)} miles</span>{form.round_trip && <span className="text-stone-500"> ({parseFloat(form.miles || 0).toFixed(1)} each way)</span>}</p><p className="text-stone-700 mt-1">Estimated claim: <span className="font-mono font-medium">{formatCurrency(parseFloat(form.miles || 0) * (form.round_trip ? 2 : 1) * (taxYear >= "2026-27" ? 0.55 : 0.45))}</span></p></>}
                 </div>
                 <Button type="submit" className="w-full bg-[#C7A76D] hover:bg-[#B8985E] text-white rounded-sm" data-testid="submit-mileage-btn">Add Mileage Entry</Button>
               </form>
@@ -148,7 +182,8 @@ const Mileage = () => {
       {/* Table */}
       <Card className="bg-white border-stone-100 card-shadow">
         <CardContent className="pt-6">
-          {data.entries.length === 0 ? (
+          <div className="relative mb-4 max-w-sm"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" /><Input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search mileage…" className="pl-9" /></div>
+          {visibleEntries.length === 0 ? (
             <div className="text-center py-12 text-stone-400">
               <Car className="w-10 h-10 mx-auto mb-3 opacity-40" />
               <p>No mileage entries for this tax year</p>
@@ -168,17 +203,17 @@ const Mileage = () => {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {data.entries.sort((a, b) => {
+                {[...visibleEntries].sort((a, b) => {
                   const da = a.date.split("/").reverse().join("");
                   const db = b.date.split("/").reverse().join("");
                   return db.localeCompare(da);
                 }).map(entry => (
-                  <TableRow key={entry.id} data-testid={"mileage-row-" + entry.id}>
+                  <TableRow key={entry.id} data-testid={"mileage-row-" + entry.id} className={searchParams.get("focus") === entry.id ? "bg-[#C7A76D]/10" : ""}>
                     <TableCell className="font-mono text-sm">{entry.date}</TableCell>
                     <TableCell className="text-sm">{entry.description}</TableCell>
-                    <TableCell className="text-sm text-stone-500">{entry.from_location} → {entry.to_location}</TableCell>
-                    <TableCell className="text-right font-mono text-sm">{entry.miles}</TableCell>
-                    <TableCell className="text-right font-mono text-sm">{entry.rate}p</TableCell>
+                    <TableCell className="text-sm text-stone-500">{entry.from_location} → {entry.to_location}{entry.round_trip && <span className="mt-1 block w-fit rounded bg-[#C7A76D]/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-[#80642F]">Round trip</span>}</TableCell>
+                    <TableCell className="text-right font-mono text-sm">{entry.miles}{entry.round_trip && entry.one_way_miles != null && <span className="block font-sans text-[10px] text-stone-400">{entry.one_way_miles} each way</span>}</TableCell>
+                    <TableCell className="text-right font-mono text-sm">{Math.round((entry.rate || 0) * 100)}p</TableCell>
                     <TableCell className="text-right font-mono text-sm font-medium">{formatCurrency(entry.amount)}</TableCell>
                     <TableCell>
                       <Button variant="ghost" size="icon" className="h-7 w-7 text-stone-400 hover:text-rose-500" onClick={() => handleDelete(entry.id)} data-testid={"delete-mileage-" + entry.id}>

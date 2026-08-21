@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,7 +14,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Plus, Receipt, Trash2, Eye, RefreshCw, Pencil, Search, Landmark, FilePlus2, AlertTriangle } from "lucide-react";
 import { formatCurrency, formatDateUK, getCurrentTaxYear, fromInputDate } from "@/utils/formatters";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
 const TAX_YEARS = [
   { id: "2023-24", label: "2023/24" },
@@ -51,13 +52,14 @@ function ukToISO(ukDate) {
 }
 
 export const Expenses = () => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [expenses, setExpenses] = useState([]);
   const [loading, setLoading] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [filterTaxYear, setFilterTaxYear] = useState("all");
-  const [filterSource, setFilterSource] = useState("all");
-  const [filterCategory, setFilterCategory] = useState("all");
-  const [searchQuery, setSearchQuery] = useState("");
+  const [filterTaxYear, setFilterTaxYear] = useState(searchParams.get("taxYear") || "all");
+  const [filterSource, setFilterSource] = useState(searchParams.get("source") || "all");
+  const [filterCategory, setFilterCategory] = useState(searchParams.get("category") || "all");
+  const [searchQuery, setSearchQuery] = useState(searchParams.get("search") || "");
   const [scanning, setScanning] = useState(false);
   const [formData, setFormData] = useState({
     description: "", amount: "", category: "", date: new Date().toISOString().split("T")[0],
@@ -95,6 +97,43 @@ export const Expenses = () => {
 
   useEffect(() => { fetchExpenses(); }, [fetchExpenses]);
   useEffect(() => { fetchTemplates(); }, [fetchTemplates]);
+
+  useEffect(() => {
+    if (searchParams.get("action") === "new") setDialogOpen(true);
+  }, [searchParams]);
+
+  useEffect(() => {
+    const values = {
+      search: searchParams.get("search") || "",
+      year: searchParams.get("taxYear") || "all",
+      source: searchParams.get("source") || "all",
+      category: searchParams.get("category") || "all",
+    };
+    if (values.search !== searchQuery) setSearchQuery(values.search);
+    if (values.year !== filterTaxYear) setFilterTaxYear(values.year);
+    if (values.source !== filterSource) setFilterSource(values.source);
+    if (values.category !== filterCategory) setFilterCategory(values.category);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    searchQuery ? next.set("search", searchQuery) : next.delete("search");
+    filterTaxYear !== "all" ? next.set("taxYear", filterTaxYear) : next.delete("taxYear");
+    filterSource !== "all" ? next.set("source", filterSource) : next.delete("source");
+    filterCategory !== "all" ? next.set("category", filterCategory) : next.delete("category");
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, filterTaxYear, filterSource, filterCategory]);
+
+  const changeExpenseDialog = (open) => {
+    setDialogOpen(open);
+    if (!open) {
+      const next = new URLSearchParams(searchParams);
+      next.delete("action");
+      setSearchParams(next, { replace: true });
+    }
+  };
 
   const handleScanPDF = async (selectedFile) => {
     if (!selectedFile || !selectedFile.name.toLowerCase().endsWith(".pdf")) return;
@@ -266,7 +305,7 @@ export const Expenses = () => {
           <p className="text-stone-500 mt-1">Review every bank and manual expense in one place</p>
         </div>
         <div className="flex items-center gap-3">
-          <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+          <Dialog open={dialogOpen} onOpenChange={changeExpenseDialog}>
             <DialogTrigger asChild>
               <Button className="bg-[#C7A76D] text-white hover:bg-[#B8985E] rounded-sm" data-testid="add-expense-btn">
                 <Plus className="w-4 h-4 mr-2" />Add Expense
@@ -492,7 +531,7 @@ export const Expenses = () => {
                 <TableRow><TableCell colSpan={7} className="text-center py-8 text-stone-400">No expenses found.</TableCell></TableRow>
               ) : (
                 filteredExpenses.map((exp) => (
-                  <TableRow key={`${exp.source}-${exp.id}`} className={`border-stone-100 ${exp.excluded_from_totals ? "opacity-60" : ""}`} data-testid={`expense-row-${exp.source}-${exp.id}`}>
+                  <TableRow key={`${exp.source}-${exp.id}`} className={`border-stone-100 ${exp.excluded_from_totals ? "opacity-60" : ""} ${searchParams.get("focus") === exp.id ? "bg-[#C7A76D]/10" : ""}`} data-testid={`expense-row-${exp.source}-${exp.id}`}>
                     <TableCell className="font-mono text-sm">{formatDateUK(exp.date)}</TableCell>
                     <TableCell className="font-medium min-w-52 max-w-md"><div className="truncate">{exp.description}</div>{exp.supplier && <div className="text-xs font-normal text-stone-400 truncate">{exp.supplier}</div>}{exp.paid_personally && <div className="text-xs font-normal text-emerald-700">Paid personally</div>}{exp.excluded_from_totals && <div className="text-xs font-normal text-stone-400">Excluded from totals</div>}</TableCell>
                     <TableCell><span className={`inline-flex items-center gap-1 text-xs px-2 py-1 rounded-sm whitespace-nowrap ${exp.source === "bank" ? "bg-sky-50 text-sky-700" : "bg-amber-50 text-amber-700"}`}>{exp.source === "bank" ? <Landmark className="w-3 h-3" /> : <FilePlus2 className="w-3 h-3" />}{exp.source_label}</span></TableCell>

@@ -11,6 +11,7 @@ import Transactions from "@/pages/Transactions";
 import TaxPrep from "@/pages/TaxPrep";
 import TidyUp from "@/pages/TidyUp";
 import Mileage from "@/pages/Mileage";
+import CashFlow from "@/pages/CashFlow";
 import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
 
@@ -64,6 +65,7 @@ function App() {
             <Route path="tax-prep" element={<TaxPrep />} />
             <Route path="tidy-up" element={<TidyUp />} />
             <Route path="mileage" element={<Mileage />} />
+            <Route path="cash-flow" element={<CashFlow />} />
           </Route>
         </Routes>
       </BrowserRouter>

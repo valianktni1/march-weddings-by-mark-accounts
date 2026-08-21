@@ -1,0 +1,34 @@
+ACCOUNTS V1.5.0 - TRUENAS DEPLOYMENT
+====================================
+
+1. Extract this release and upload its complete contents to the main branch of:
+   https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+2. In the TrueNAS shell, run these commands exactly:
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d backend frontend
+
+docker compose -f "$ACCOUNTS_COMPOSE" ps
+curl -fsS http://127.0.0.1:30053/api/health
+echo
+
+Expected build:
+2026.08.21-cash-flow-navigation-round-trip-v1.5.0
+
+AFTER DEPLOYMENT
+----------------
+1. Open Cash Flow from the Accounts navigation.
+2. Check the incoming balances and dates before adding any planned outgoings.
+3. Optionally set today's bank balance to enable estimated future balances.
+4. Try Back, Forward and the search box at the top of the app.
+5. Add a test mileage entry with Round trip selected and check that the total is doubled and labelled.
+
+IMPORTANT
+---------
+- Keep BOOKING_INTEGRATION_ENABLED set to "false" in the Accounts compose file.
+- No database migration command is required.
+- Forecast records never create expenses, transactions or tax entries.
+- Existing invoices, expenses, statements, mileage and tax-year closes are unchanged.

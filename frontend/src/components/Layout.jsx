@@ -1,4 +1,6 @@
-import { Outlet, NavLink } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Outlet, NavLink, useNavigate } from "react-router-dom";
+import axios from "axios";
 import { 
   LayoutDashboard, 
   FileText, 
@@ -9,6 +11,10 @@ import {
   Calculator,
   ListChecks,
   Car,
+  CalendarClock,
+  ArrowLeft,
+  ArrowRight,
+  Search,
   LogOut
 } from "lucide-react";
 
@@ -21,9 +27,36 @@ const navItems = [
   { path: "/transactions", label: "Transactions", icon: ArrowLeftRight },
   { path: "/tax-prep", label: "Tax Year Close", icon: Calculator },
   { path: "/tidy-up", label: "Tidy Up", icon: ListChecks },
+  { path: "/cash-flow", label: "Cash Flow", icon: CalendarClock },
 ];
 
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
+
 export const Layout = ({ user, onSignOut }) => {
+  const navigate = useNavigate();
+  const [search, setSearch] = useState("");
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+
+  useEffect(() => {
+    if (search.trim().length < 2) { setResults([]); setSearching(false); return undefined; }
+    setSearching(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await axios.get(`${API}/search`, { params: { q: search.trim(), limit: 10 } });
+        setResults(response.data);
+      } catch { setResults([]); }
+      finally { setSearching(false); }
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+
+  const openResult = (path) => {
+    navigate(path);
+    setSearch("");
+    setResults([]);
+  };
+
   return (
     <div className="min-h-screen bg-[#FAFAF9]" data-testid="app-layout">
       {/* Sidebar */}
@@ -83,6 +116,34 @@ export const Layout = ({ user, onSignOut }) => {
 
       {/* Main Content */}
       <main className="md:ml-64 min-h-screen">
+        <div className="sticky top-0 z-20 border-b border-stone-200 bg-[#FAFAF9]/95 px-4 py-3 backdrop-blur sm:px-6 md:px-8">
+          <div className="mx-auto flex max-w-7xl items-center gap-2">
+            <ButtonIcon label="Go back" onClick={() => navigate(-1)}><ArrowLeft className="h-4 w-4" /></ButtonIcon>
+            <ButtonIcon label="Go forward" onClick={() => navigate(1)}><ArrowRight className="h-4 w-4" /></ButtonIcon>
+            <div className="relative ml-1 max-w-xl flex-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-stone-400" />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter" && results[0]) openResult(results[0].path); }}
+                placeholder="Search invoices, expenses, bank records…"
+                aria-label="Search all accounts"
+                className="h-10 w-full rounded-lg border border-stone-200 bg-white pl-9 pr-3 text-sm outline-none transition focus:border-[#C7A76D] focus:ring-2 focus:ring-[#C7A76D]/20"
+                data-testid="global-search"
+              />
+              {(search.trim().length >= 2) && (
+                <div className="absolute left-0 right-0 top-12 z-40 overflow-hidden rounded-lg border border-stone-200 bg-white shadow-xl" data-testid="global-search-results">
+                  {searching ? <p className="p-4 text-sm text-stone-500">Searching…</p> : results.length === 0 ? <p className="p-4 text-sm text-stone-500">No matching records</p> : results.map((item) => (
+                    <button key={`${item.type}-${item.id}`} onClick={() => openResult(item.path)} className="flex w-full items-start gap-3 border-b border-stone-100 px-4 py-3 text-left last:border-0 hover:bg-stone-50">
+                      <span className="mt-0.5 rounded bg-[#C7A76D]/10 px-2 py-0.5 text-[10px] font-bold uppercase text-[#8A6C37]">{item.type}</span>
+                      <span className="min-w-0"><span className="block truncate text-sm font-semibold text-stone-800">{item.title}</span><span className="block truncate text-xs text-stone-500">{item.subtitle}</span></span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
         <div className="p-4 sm:p-6 md:p-8 max-w-7xl mx-auto">
           <Outlet />
         </div>
@@ -90,5 +151,11 @@ export const Layout = ({ user, onSignOut }) => {
     </div>
   );
 };
+
+const ButtonIcon = ({ label, onClick, children }) => (
+  <button type="button" onClick={onClick} aria-label={label} title={label} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 hover:border-[#C7A76D] hover:text-[#9A7B43]">
+    {children}
+  </button>
+);
 
 export default Layout;

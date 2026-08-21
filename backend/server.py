@@ -31,6 +31,8 @@ from tax_year_close import (
     snapshot_digest,
     tax_year_bounds,
 )
+from cash_flow import build_cash_flow_forecast, parse_date as parse_cash_flow_date
+from mileage_calculator import normalise_trip_miles
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -53,7 +55,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.21-close-check-action-centre-v1.4.9"
+BUILD_ID = "2026.08.21-cash-flow-navigation-round-trip-v1.5.0"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -363,6 +365,19 @@ class ExpenseBankLink(BaseModel):
 class EquipmentReviewUpdate(BaseModel):
     status: str = Field(pattern="^(keep_current|flag_capital|unreviewed)$")
     note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class CashFlowCommitmentCreate(BaseModel):
+    description: str = Field(min_length=1, max_length=300)
+    amount: float = Field(gt=0, le=10000000)
+    next_due_date: str = Field(min_length=8, max_length=20)
+    recurrence: str = Field(default="none", pattern="^(none|weekly|monthly|quarterly|yearly)$")
+    category: Optional[str] = Field(default=None, max_length=160)
+    active: bool = True
+
+
+class CashFlowBalanceUpdate(BaseModel):
+    balance: Optional[float] = Field(default=None, ge=-10000000, le=10000000)
 
 
 def _expense_date_key(value: Optional[str]) -> datetime:
@@ -3977,6 +3992,143 @@ async def get_dashboard_extras(tax_year: str):
     }
 
 
+def _cash_flow_commitment_document(payload: CashFlowCommitmentCreate, *, record_id: str, created_at: str) -> dict:
+    if not parse_cash_flow_date(payload.next_due_date):
+        raise HTTPException(status_code=422, detail="Choose a valid next due date")
+    return {
+        "id": record_id,
+        "description": payload.description.strip(),
+        "amount": round(float(payload.amount), 2),
+        "next_due_date": format_date_uk(payload.next_due_date),
+        "recurrence": payload.recurrence,
+        "category": (payload.category or "").strip() or None,
+        "active": payload.active,
+        "created_at": created_at,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@api_router.get("/cash-flow")
+async def get_cash_flow(horizon_days: int = 90):
+    horizon_days = max(30, min(horizon_days, 365))
+    invoices, commitments, settings = await asyncio.gather(
+        db.invoices.find({}, {"_id": 0}).to_list(100000),
+        db.cash_flow_commitments.find({}, {"_id": 0}).to_list(10000),
+        get_settings(),
+    )
+    starting_balance = settings.get("cash_flow_starting_balance") if "cash_flow_starting_balance" in settings else None
+    forecast = build_cash_flow_forecast(
+        invoices=invoices,
+        commitments=commitments,
+        today=datetime.now(timezone.utc).date(),
+        starting_balance=float(starting_balance) if starting_balance is not None else None,
+        horizon_days=horizon_days,
+    )
+    forecast["commitments"] = sorted(
+        commitments,
+        key=lambda item: (parse_cash_flow_date(item.get("next_due_date")) or datetime.max.date(), item.get("description") or ""),
+    )
+    return forecast
+
+
+@api_router.put("/cash-flow/balance")
+async def update_cash_flow_balance(payload: CashFlowBalanceUpdate):
+    if payload.balance is None:
+        await db.settings.update_one({}, {"$unset": {"cash_flow_starting_balance": ""}}, upsert=True)
+        return {"starting_balance": None, "configured": False}
+    balance = round(float(payload.balance), 2)
+    await db.settings.update_one({}, {"$set": {"cash_flow_starting_balance": balance}}, upsert=True)
+    return {"starting_balance": balance, "configured": True}
+
+
+@api_router.post("/cash-flow/commitments")
+async def create_cash_flow_commitment(payload: CashFlowCommitmentCreate):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    record = _cash_flow_commitment_document(payload, record_id=str(uuid.uuid4()), created_at=now_iso)
+    await db.cash_flow_commitments.insert_one(record)
+    record.pop("_id", None)
+    return record
+
+
+@api_router.put("/cash-flow/commitments/{commitment_id}")
+async def update_cash_flow_commitment(commitment_id: str, payload: CashFlowCommitmentCreate):
+    existing = await db.cash_flow_commitments.find_one({"id": commitment_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Planned outgoing not found")
+    record = _cash_flow_commitment_document(
+        payload, record_id=commitment_id, created_at=existing.get("created_at") or datetime.now(timezone.utc).isoformat(),
+    )
+    await db.cash_flow_commitments.update_one({"id": commitment_id}, {"$set": record})
+    return record
+
+
+@api_router.delete("/cash-flow/commitments/{commitment_id}")
+async def delete_cash_flow_commitment(commitment_id: str):
+    result = await db.cash_flow_commitments.delete_one({"id": commitment_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Planned outgoing not found")
+    return {"status": "deleted"}
+
+
+def _recent_timestamp(record: dict) -> str:
+    return str(record.get("updated_at") or record.get("created_at") or "")
+
+
+@api_router.get("/recent-records")
+async def get_recent_records(limit: int = 8):
+    limit = max(1, min(limit, 20))
+    invoices, expenses, transactions, mileage, commitments = await asyncio.gather(
+        db.invoices.find({}, {"_id": 0}).sort([("updated_at", -1), ("created_at", -1)]).to_list(limit),
+        db.expenses.find({}, {"_id": 0}).sort([("updated_at", -1), ("created_at", -1)]).to_list(limit),
+        db.transactions.find({}, {"_id": 0}).sort([("updated_at", -1), ("created_at", -1)]).to_list(limit),
+        db.mileage.find({}, {"_id": 0}).sort("created_at", -1).to_list(limit),
+        db.cash_flow_commitments.find({}, {"_id": 0}).sort([("updated_at", -1), ("created_at", -1)]).to_list(limit),
+    )
+    rows = []
+    for item in invoices:
+        rows.append({"type": "invoice", "id": item.get("id"), "title": item.get("couple_names") or item.get("client_name") or "Invoice", "subtitle": item.get("invoice_number") or "Invoice", "amount": item.get("total_price", 0), "timestamp": _recent_timestamp(item), "path": f"/invoices?focus={item.get('id', '')}"})
+    for item in expenses:
+        rows.append({"type": "expense", "id": item.get("id"), "title": item.get("description") or "Expense", "subtitle": item.get("supplier") or "Manual expense", "amount": item.get("amount", 0), "timestamp": _recent_timestamp(item), "path": f"/expenses?focus={item.get('id', '')}"})
+    for item in transactions:
+        rows.append({"type": "transaction", "id": item.get("id"), "title": item.get("description") or "Bank transaction", "subtitle": str(item.get("transaction_type") or "Transaction").replace("_", " ").title(), "amount": item.get("amount", 0), "timestamp": _recent_timestamp(item), "path": f"/transactions?focus={item.get('id', '')}"})
+    for item in mileage:
+        rows.append({"type": "mileage", "id": item.get("id"), "title": item.get("description") or "Mileage", "subtitle": f"{item.get('miles', 0)} miles", "amount": item.get("amount", 0), "timestamp": _recent_timestamp(item), "path": f"/mileage?focus={item.get('id', '')}"})
+    for item in commitments:
+        rows.append({"type": "commitment", "id": item.get("id"), "title": item.get("description") or "Planned outgoing", "subtitle": f"Due {item.get('next_due_date', '')}", "amount": item.get("amount", 0), "timestamp": _recent_timestamp(item), "path": f"/cash-flow?focus={item.get('id', '')}"})
+    rows.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
+    return rows[:limit]
+
+
+@api_router.get("/search")
+async def global_search(q: str, limit: int = 20):
+    query = q.strip()
+    if len(query) < 2:
+        return []
+    limit = max(1, min(limit, 50))
+    regex = {"$regex": re.escape(query), "$options": "i"}
+    invoices, expenses, transactions, mileage, commitments = await asyncio.gather(
+        db.invoices.find({"$or": [{field: regex} for field in ("invoice_number", "legacy_invoice_number", "couple_names", "client_name", "client_email", "venue")]}, {"_id": 0}).to_list(limit),
+        db.expenses.find({"$or": [{"description": regex}, {"supplier": regex}]}, {"_id": 0}).to_list(limit),
+        db.transactions.find({"$or": [{"description": regex}, {"category": regex}]}, {"_id": 0}).to_list(limit),
+        db.mileage.find({"$or": [{"description": regex}, {"from_location": regex}, {"to_location": regex}]}, {"_id": 0}).to_list(limit),
+        db.cash_flow_commitments.find({"$or": [{"description": regex}, {"category": regex}]}, {"_id": 0}).to_list(limit),
+    )
+    results = []
+    for item in invoices:
+        results.append({"type": "Invoice", "id": item.get("id"), "title": item.get("couple_names") or item.get("client_name") or item.get("invoice_number"), "subtitle": " · ".join(value for value in (item.get("invoice_number"), item.get("venue")) if value), "path": f"/invoices?search={query}&focus={item.get('id', '')}"})
+    for item in expenses:
+        results.append({"type": "Expense", "id": item.get("id"), "title": item.get("description"), "subtitle": item.get("supplier") or item.get("category") or "Manual expense", "path": f"/expenses?search={query}&focus={item.get('id', '')}"})
+    for item in transactions:
+        results.append({"type": "Transaction", "id": item.get("id"), "title": item.get("description"), "subtitle": str(item.get("transaction_type") or "Bank record").replace("_", " ").title(), "path": f"/transactions?search={query}&focus={item.get('id', '')}"})
+    for item in mileage:
+        results.append({"type": "Mileage", "id": item.get("id"), "title": item.get("description"), "subtitle": f"{item.get('from_location', '')} to {item.get('to_location', '')}".strip(), "path": f"/mileage?search={query}&focus={item.get('id', '')}"})
+    for item in commitments:
+        results.append({"type": "Cash flow", "id": item.get("id"), "title": item.get("description"), "subtitle": f"Due {item.get('next_due_date', '')}", "path": f"/cash-flow?search={query}&focus={item.get('id', '')}"})
+    lowered = query.lower()
+    results.sort(key=lambda item: (0 if str(item.get("title") or "").lower().startswith(lowered) else 1, item.get("type") or "", item.get("title") or ""))
+    return results[:limit]
+
+
 
 # Mileage endpoints
 @api_router.get("/mileage")
@@ -3990,7 +4142,11 @@ async def get_mileage(tax_year: str = None):
 
 @api_router.post("/mileage")
 async def create_mileage(entry: dict):
-    miles = float(entry.get("miles", 0))
+    round_trip = entry.get("round_trip") is True
+    try:
+        miles, one_way_miles = normalise_trip_miles(entry.get("miles"), round_trip)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     tax_year = entry.get("tax_year", "")
     await _assert_tax_year_open(tax_year)
     existing = await db.mileage.find({"tax_year": tax_year}, {"_id": 0}).to_list(10000)
@@ -4022,6 +4178,8 @@ async def create_mileage(entry: dict):
         "from_location": entry.get("from_location", ""),
         "to_location": entry.get("to_location", ""),
         "miles": miles,
+        "round_trip": round_trip,
+        "one_way_miles": one_way_miles,
         "rate": rate,
         "amount": amount,
         "tax_year": tax_year,
@@ -4178,6 +4336,7 @@ BACKUP_COLLECTIONS = [
     "booking_bank_match_audit",
     "expense_review_audit",
     "migration_audits",
+    "cash_flow_commitments",
 ]
 BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
 
@@ -4456,6 +4615,10 @@ async def startup_checks():
     await db.expense_review_audit.create_index(
         [("tax_year", 1), ("created_at", -1)],
         name="expense_review_audit_history",
+    )
+    await db.cash_flow_commitments.create_index(
+        [("active", 1), ("next_due_date", 1)],
+        name="cash_flow_due_dates",
     )
 
 
