@@ -1,0 +1,34 @@
+ACCOUNTS V1.4.9 - TRUENAS DEPLOYMENT
+====================================
+
+1. Extract this release and upload its complete contents to the main branch of:
+   https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+2. In the TrueNAS shell, run these commands exactly:
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d backend frontend
+
+docker compose -f "$ACCOUNTS_COMPOSE" ps
+curl -fsS http://127.0.0.1:30053/api/health
+echo
+
+Expected build:
+2026.08.21-close-check-action-centre-v1.4.9
+
+AFTER DEPLOYMENT
+----------------
+1. Open Tidy Up from the Accounts navigation.
+2. Choose 2025/26 or another populated year.
+3. Use Review & fix beside each affected record.
+4. Return to Tidy Up to see the all-years totals refresh.
+
+IMPORTANT
+---------
+- Keep BOOKING_INTEGRATION_ENABLED set to "false" in the Accounts compose file.
+- No database migration command is required.
+- Existing records are not automatically changed, reclassified or removed.
+- Delete only a genuine duplicate. Use Paid personally for genuine business spending from personal funds.
+- Equipment review records your decision but does not automatically decide tax treatment.

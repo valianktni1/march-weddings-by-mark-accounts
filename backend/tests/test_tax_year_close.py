@@ -88,6 +88,49 @@ def test_personally_paid_manual_expense_does_not_false_match_same_day_bank_payme
     assert personal_row["expense_source"] == "manual expense paid personally"
 
 
+def test_action_centre_returns_every_affected_record_and_matching_bank_candidates():
+    result = snapshot(
+        transactions=[{
+            "id": "tx-card", "date": "17/06/2025", "description": "Credit card payment",
+            "amount": 80, "transaction_type": "expense", "category": "Other",
+            "tax_year": "2025-26", "excluded_from_totals": False,
+        }],
+        expenses=[{
+            "id": "manual-hotel", "date": "17/06/2025", "description": "Awards accommodation",
+            "amount": 80, "category": "Travel & Mileage", "tax_year": "2025-26",
+        }],
+    )
+
+    check = next(item for item in result["validation"]["checks"] if item["code"] == "manual_bank_duplicates")
+    assert check["count"] == 1
+    assert check["records"][0]["id"] == "manual-hotel"
+    assert check["records"][0]["source"] == "manual expense"
+    assert check["records"][0]["bank_candidates"][0]["id"] == "tx-card"
+
+
+def test_reviewed_equipment_can_be_cleared_or_left_flagged_for_accountant():
+    base_expense = {
+        "id": "grip", "date": "28/06/2025", "description": "Double battery grip",
+        "amount": 79.90, "category": "Equipment & Gear", "tax_year": "2025-26",
+        "file_name": "receipt.pdf",
+    }
+    unreviewed = snapshot(expenses=[base_expense])
+    assert "capital_items_review" in {item["code"] for item in unreviewed["validation"]["checks"]}
+
+    keep_current = snapshot(expenses=[{
+        **base_expense,
+        "equipment_review": {"status": "keep_current", "note": "Reviewed and retained"},
+    }])
+    assert "capital_items_review" not in {item["code"] for item in keep_current["validation"]["checks"]}
+
+    flag_capital = snapshot(expenses=[{
+        **base_expense,
+        "equipment_review": {"status": "flag_capital", "note": "Ask accountant"},
+    }])
+    warning = next(item for item in flag_capital["validation"]["checks"] if item["code"] == "capital_items_review")
+    assert warning["records"][0]["equipment_review_status"] == "flag_capital"
+
+
 def test_booking_payments_reconcile_but_never_add_invoice_income_twice():
     result = snapshot(
         transactions=[{

@@ -151,6 +151,10 @@ def _issue(code: str, severity: str, title: str, records: list[dict], guidance: 
         "count": len(records),
         "amount": round(sum(abs(money(item.get("amount"))) for item in records), 2),
         "examples": records[:5],
+        # The administrator action centre needs every affected row, not only
+        # the five examples shown by older releases.  These are already the
+        # deliberately small, sanitised ledger rows used by the evidence pack.
+        "records": records,
         "guidance": guidance,
     }
 
@@ -227,19 +231,34 @@ def build_tax_snapshot(
         if item.get("active", True)
     }
 
-    def validate(records: list[dict], kind: str) -> None:
+    def validate(records: list[dict], kind: str, source: str) -> None:
         for record in records:
             record_date = record.get("date")
+            issue_record = {
+                "kind": kind,
+                "source": source,
+                "id": record.get("id", ""),
+                "date": record_date,
+                "description": record.get("description", ""),
+                "amount": record.get("amount"),
+                "category": record.get("category") or "",
+                "supplier": record.get("supplier") or "",
+                "transaction_type": record.get("transaction_type") or "",
+                "included": not bool(record.get("excluded_from_totals")) and record.get("include_in_totals") is not False,
+                "excluded_from_totals": bool(record.get("excluded_from_totals")) or record.get("include_in_totals") is False,
+                "paid_personally": bool(record.get("paid_personally")),
+                "receipt_file": str(record.get("file_name") or ""),
+            }
             if record_date and not parse_date(record_date):
-                invalid_records.append({"kind": kind, "id": record.get("id", ""), "date": record_date, "description": record.get("description", "")})
+                invalid_records.append(issue_record)
             if record_date and parse_date(record_date) and not date_in_tax_year(record_date, tax_year):
-                mismatched_year.append({"kind": kind, "id": record.get("id", ""), "date": record_date, "description": record.get("description", "")})
+                mismatched_year.append(issue_record)
             if money(record.get("amount")) < 0 and kind != "invoice payment":
-                negative_records.append({"kind": kind, "id": record.get("id", ""), "date": record_date, "description": record.get("description", ""), "amount": record.get("amount")})
+                negative_records.append(issue_record)
 
-    validate(transactions, "bank transaction")
-    validate(expenses, "expense")
-    validate(mileage, "mileage")
+    validate(transactions, "bank transaction", "bank")
+    validate(expenses, "expense", "manual")
+    validate(mileage, "mileage", "mileage")
     if invalid_records:
         checks.append(_issue("invalid_dates", "blocker", "Records have invalid dates", invalid_records, "Correct these dates before closing the year."))
     if mismatched_year:
@@ -268,6 +287,8 @@ def build_tax_snapshot(
             "included": not excluded and tx_type in {"income", "expense"},
             "source": "bank",
             "bank_statement_id": str(tx.get("bank_statement_id") or ""),
+            "equipment_review_status": str((tx.get("equipment_review") or {}).get("status") or ""),
+            "equipment_review_note": str((tx.get("equipment_review") or {}).get("note") or ""),
         }
         transaction_ledger.append(base)
         if excluded or tx_type in {"owner_withdrawal", "tax_payment"}:
@@ -306,6 +327,8 @@ def build_tax_snapshot(
             "source_transaction_id": str(expense.get("source_transaction_id") or ""),
             "paid_personally": bool(expense.get("paid_personally")),
             "receipt_file": str(expense.get("file_name") or ""),
+            "equipment_review_status": str((expense.get("equipment_review") or {}).get("status") or ""),
+            "equipment_review_note": str((expense.get("equipment_review") or {}).get("note") or ""),
         }
         expense_ledger.append(row)
         if included and not row["category"]:
@@ -337,10 +360,10 @@ def build_tax_snapshot(
             bank_expense_keys[(iso_date(row["date"]), row["amount"])].append(row)
     possible_double_count = []
     for row in expense_ledger:
+        candidates = bank_expense_keys.get((iso_date(row["date"]), row["amount"]))
         if (row["source"] == "manual expense" and row["included"]
-                and not row.get("paid_personally")
-                and bank_expense_keys.get((iso_date(row["date"]), row["amount"]))):
-            possible_double_count.append(row)
+                and not row.get("paid_personally") and candidates):
+            possible_double_count.append({**row, "bank_candidates": candidates})
     if possible_double_count:
         checks.append(_issue("manual_bank_duplicates", "blocker", "Manual expenses may duplicate bank payments", possible_double_count, "Delete the duplicate manual record, link it to the bank transaction, or mark a genuine expense as paid personally."))
 
@@ -548,7 +571,12 @@ def build_tax_snapshot(
     if pending_statements:
         checks.append(_issue("unprocessed_statements", "warning", "Bank statements are pending or failed", pending_statements, "Check whether these statements belong to this tax year and extract them if required."))
 
-    capital_review = [row for row in expense_ledger if row["included"] and row.get("category") == "Equipment & Gear"]
+    capital_review = [
+        row for row in expense_ledger
+        if row["included"]
+        and row.get("category") == "Equipment & Gear"
+        and row.get("equipment_review_status") != "keep_current"
+    ]
     if capital_review:
         checks.append(_issue("capital_items_review", "warning", "Equipment purchases may need capital treatment", capital_review, "Review equipment purchases before filing, particularly higher-value items."))
 

@@ -7,6 +7,7 @@ import {
   ArrowLeftRight,
   Camera,
   Calculator,
+  ListChecks,
   Car,
   LogOut
 } from "lucide-react";
@@ -19,6 +20,7 @@ const navItems = [
   { path: "/bank-statements", label: "Bank Statements", icon: Building2 },
   { path: "/transactions", label: "Transactions", icon: ArrowLeftRight },
   { path: "/tax-prep", label: "Tax Year Close", icon: Calculator },
+  { path: "/tidy-up", label: "Tidy Up", icon: ListChecks },
 ];
 
 export const Layout = ({ user, onSignOut }) => {

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import axios from "axios";
+import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   AlertCircle, Archive, Banknote, CheckCircle2, Download, FileCheck2, LockKeyhole,
-  PoundSterling, RefreshCw, RotateCcw, ShieldCheck, TrendingDown,
-  TrendingUp, TriangleAlert,
+  Link2, Pencil, PoundSterling, Receipt, RefreshCw, RotateCcw, ShieldCheck,
+  Trash2, TrendingDown, TrendingUp, TriangleAlert, Upload, WalletCards,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -21,6 +22,12 @@ import { Textarea } from "@/components/ui/textarea";
 import { getCurrentTaxYear } from "@/utils/formatters";
 
 const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
+const EXPENSE_CATEGORIES = [
+  "Travel & Mileage", "Equipment & Gear", "Software & Subscriptions",
+  "Professional Services", "Marketing & Advertising", "Office & Supplies",
+  "Insurance", "Training & Development", "Venue & Location Fees",
+  "Utilities", "Bank Fees", "Other",
+];
 const money = (value) => new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(Number(value || 0));
 const dateTime = (value) => {
   if (!value) return "—";
@@ -35,8 +42,9 @@ const errorText = (error, fallback) => {
 };
 
 export default function TaxPrep() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [taxYears, setTaxYears] = useState([]);
-  const [taxYear, setTaxYear] = useState(getCurrentTaxYear());
+  const [taxYear, setTaxYear] = useState(searchParams.get("year") || getCurrentTaxYear());
   const [data, setData] = useState(null);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -58,6 +66,18 @@ export default function TaxPrep() {
   const [bankTransactionId, setBankTransactionId] = useState("");
   const [bankMatchReason, setBankMatchReason] = useState("");
   const [bankMatchConfirmation, setBankMatchConfirmation] = useState("");
+  const [issueAction, setIssueAction] = useState(null);
+  const [issueCategory, setIssueCategory] = useState("");
+  const [issueExcluded, setIssueExcluded] = useState(false);
+  const [issuePaidPersonally, setIssuePaidPersonally] = useState(false);
+  const [issueEquipmentStatus, setIssueEquipmentStatus] = useState("unreviewed");
+  const [issueEquipmentNote, setIssueEquipmentNote] = useState("");
+  const [issueReceipt, setIssueReceipt] = useState(null);
+  const [issueBankId, setIssueBankId] = useState("none");
+  const [batchAction, setBatchAction] = useState(null);
+  const [batchSelected, setBatchSelected] = useState([]);
+  const [batchCategory, setBatchCategory] = useState("");
+  const [batchPaidPersonally, setBatchPaidPersonally] = useState(false);
 
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -83,6 +103,11 @@ export default function TaxPrep() {
   }, [taxYear]);
   useEffect(() => { setSelectedBankPayments([]); }, [taxYear]);
   useEffect(() => { load(); }, [load]);
+
+  const changeTaxYear = (value) => {
+    setTaxYear(value);
+    setSearchParams({ year: value });
+  };
 
   const resetDialog = () => { setReason(""); setConfirmation(""); setAcknowledged(false); };
   const closeYear = async () => {
@@ -178,6 +203,146 @@ export default function TaxPrep() {
     finally { setWorking(false); }
   };
 
+  const issueSource = (record) => record?.source === "manual expense" ? "manual" : record?.source;
+  const openIssueRecord = (check, record) => {
+    const source = issueSource(record);
+    if (source === "bank" && record.transaction_type && record.transaction_type !== "expense") {
+      toast.info("Opening Transactions so this bank record keeps its original income/payment type");
+      window.location.href = "/transactions";
+      return;
+    }
+    if (!['bank', 'manual'].includes(source)) {
+      if (source === "mileage") window.location.href = "/mileage";
+      else toast.error("Open the original section to correct this record");
+      return;
+    }
+    setIssueAction({ check, record, source });
+    setIssueCategory(record.category || "");
+    setIssueExcluded(record.included === false || Boolean(record.excluded_from_totals));
+    setIssuePaidPersonally(Boolean(record.paid_personally));
+    setIssueEquipmentStatus(record.equipment_review_status || "unreviewed");
+    setIssueEquipmentNote(record.equipment_review_note || "");
+    setIssueReceipt(null);
+    setIssueBankId("none");
+  };
+
+  const saveIssueRecord = async () => {
+    if (!issueAction) return;
+    if (!issueExcluded && !issueCategory) {
+      toast.error("Choose an expense category or exclude the record");
+      return;
+    }
+    const { record, source } = issueAction;
+    setWorking(true);
+    try {
+      if (source === "bank") {
+        await axios.put(`${API}/transactions/${record.id}`, {
+          transaction_type: "expense",
+          category: issueCategory || null,
+          excluded_from_totals: issueExcluded,
+        });
+      } else {
+        await axios.put(`${API}/expenses/${record.id}`, {
+          description: record.description || "Reviewed expense",
+          supplier: record.supplier || null,
+          category: issueCategory || null,
+          include_in_totals: !issueExcluded,
+          paid_personally: issuePaidPersonally,
+        });
+      }
+
+      if (issueReceipt && source === "manual" && !record.receipt_file) {
+        const form = new FormData();
+        form.append("file", issueReceipt);
+        await axios.post(`${API}/expenses/${record.id}/receipt`, form);
+      }
+      if (issueBankId !== "none" && source === "manual") {
+        await axios.post(`${API}/tax-year-close/${taxYear}/expenses/${record.id}/link-bank`, { transaction_id: issueBankId });
+      }
+      if (issueCategory === "Equipment & Gear" && (
+        issueEquipmentStatus !== (record.equipment_review_status || "unreviewed")
+        || issueEquipmentNote !== (record.equipment_review_note || "")
+      )) {
+        await axios.put(`${API}/tax-year-close/${taxYear}/expense-records/${source}/${record.id}/equipment-review`, {
+          status: issueEquipmentStatus,
+          note: issueEquipmentNote,
+        });
+      }
+      toast.success("Record updated and close checks refreshed");
+      setIssueAction(null);
+      await load(true);
+    } catch (error) {
+      toast.error(errorText(error, "The record could not be updated"));
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const deleteIssueRecord = async () => {
+    if (!issueAction) return;
+    const { record, source } = issueAction;
+    if (!window.confirm(`Permanently delete this duplicate record?\n\n${record.description || "Expense"} · ${money(record.amount)}`)) return;
+    setWorking(true);
+    try {
+      await axios.delete(`${API}/${source === "bank" ? "transactions" : "expenses"}/${record.id}`);
+      toast.success("Duplicate record deleted and checks refreshed");
+      setIssueAction(null);
+      await load(true);
+    } catch (error) {
+      toast.error(errorText(error, "The duplicate could not be deleted"));
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const openBatchEdit = (check, records) => {
+    const actionable = records.filter((record) => {
+      const source = issueSource(record);
+      return source === "manual" || (source === "bank" && (!record.transaction_type || record.transaction_type === "expense"));
+    });
+    setBatchAction({ check, records: actionable });
+    setBatchSelected(actionable.map((record) => `${issueSource(record)}:${record.id}`));
+    setBatchCategory("");
+    setBatchPaidPersonally(false);
+  };
+
+  const toggleBatchRecord = (key) => setBatchSelected((current) => current.includes(key)
+    ? current.filter((item) => item !== key)
+    : [...current, key]);
+
+  const saveBatchEdit = async () => {
+    if (!batchAction || !batchCategory || batchSelected.length === 0) return;
+    setWorking(true);
+    try {
+      const selected = batchAction.records.filter((record) => batchSelected.includes(`${issueSource(record)}:${record.id}`));
+      await Promise.all(selected.map((record) => {
+        const source = issueSource(record);
+        if (source === "bank") {
+          return axios.put(`${API}/transactions/${record.id}`, {
+            transaction_type: "expense",
+            category: batchCategory,
+            excluded_from_totals: record.included === false,
+          });
+        }
+        return axios.put(`${API}/expenses/${record.id}`, {
+          description: record.description || "Reviewed expense",
+          supplier: record.supplier || null,
+          category: batchCategory,
+          include_in_totals: record.included !== false,
+          paid_personally: batchPaidPersonally ? true : Boolean(record.paid_personally),
+        });
+      }));
+      toast.success(`${selected.length} records updated and checks refreshed`);
+      setBatchAction(null);
+      await load(true);
+    } catch (error) {
+      toast.error(errorText(error, "The batch update could not be completed"));
+      await load(true);
+    } finally {
+      setWorking(false);
+    }
+  };
+
   if (loading || !data) return <div className="flex min-h-[50vh] items-center justify-center text-stone-500"><RefreshCw className="mr-2 h-5 w-5 animate-spin" />Checking the tax year…</div>;
 
   const review = data.review;
@@ -209,7 +374,7 @@ export default function TaxPrep() {
           <p className="mt-1 max-w-2xl text-sm text-stone-500">Check the figures, resolve anything unusual, then create one permanent accountant-ready evidence pack.</p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
-          <Select value={taxYear} onValueChange={setTaxYear}>
+          <Select value={taxYear} onValueChange={changeTaxYear}>
             <SelectTrigger className="w-full bg-white sm:w-40" data-testid="tax-year-select"><SelectValue /></SelectTrigger>
             <SelectContent>{taxYears.map((item) => <SelectItem key={item.id} value={item.id}>{item.label}</SelectItem>)}</SelectContent>
           </Select>
@@ -230,14 +395,26 @@ export default function TaxPrep() {
       </div>
 
       <Card className="border-stone-200">
-        <CardHeader className="border-b border-stone-100 pb-4"><div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><CardTitle className="text-lg">Close checks</CardTitle><div className="flex gap-2"><Badge className={validation.blocker_count ? "bg-rose-100 text-rose-800" : "bg-emerald-100 text-emerald-800"}>{validation.blocker_count} blocking</Badge><Badge className="bg-amber-100 text-amber-800">{validation.warning_count} warnings</Badge></div></div></CardHeader>
+        <CardHeader className="border-b border-stone-100 pb-4"><div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><div><CardTitle className="text-lg">Close Checks Action Centre</CardTitle><p className="mt-1 text-sm text-stone-500">Open the affected record here, make the decision, and the checks refresh automatically.</p></div><div className="flex gap-2"><Badge className={validation.blocker_count ? "bg-rose-100 text-rose-800" : "bg-emerald-100 text-emerald-800"}>{validation.blocker_count} blocking</Badge><Badge className="bg-amber-100 text-amber-800">{validation.warning_count} warnings</Badge></div></div></CardHeader>
         <CardContent className="p-0">
           {validation.checks.length === 0 ? <div className="flex items-center gap-3 p-6 text-emerald-800"><CheckCircle2 className="h-5 w-5" /><span className="font-medium">All checks passed. This year is ready to close.</span></div> : <div className="divide-y divide-stone-100">
-            {validation.checks.map((check) => <div key={check.code} className="p-4 sm:p-5"><div className="flex items-start gap-3">
-              {check.severity === "blocker" ? <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-rose-600" /> : <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />}
-              <div className="min-w-0 flex-1"><div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between"><p className="font-semibold text-stone-900">{check.title}</p><p className="text-sm font-medium text-stone-500">{check.count} record{check.count === 1 ? "" : "s"}{check.amount ? ` · ${money(check.amount)}` : ""}</p></div><p className="mt-1 text-sm text-stone-600">{check.guidance}</p>
-                {check.examples?.length > 0 && <div className="mt-3 space-y-1 rounded-lg bg-stone-50 p-3 text-xs text-stone-600">{check.examples.map((item, index) => <div key={`${item.id || check.code}-${index}`} className="flex flex-col justify-between gap-1 sm:flex-row"><span className="truncate">{item.date || "No date"} · {item.description || item.client || item.invoice_number || "Record"}</span>{item.amount !== undefined && <span className="shrink-0 font-mono">{money(item.amount)}</span>}</div>)}</div>}
-              </div></div></div>)}
+            {validation.checks.map((check) => {
+              const records = check.records || check.examples || [];
+              return <div key={check.code} className="p-4 sm:p-5"><div className="flex items-start gap-3">
+                {check.severity === "blocker" ? <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-rose-600" /> : <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />}
+                <div className="min-w-0 flex-1"><div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><p className="font-semibold text-stone-900">{check.title}</p><div className="flex flex-wrap items-center gap-2"><p className="text-sm font-medium text-stone-500">{check.count} record{check.count === 1 ? "" : "s"}{check.amount ? ` · ${money(check.amount)}` : ""}</p>{check.code === "uncategorised_expenses" && records.length > 1 && !isClosed && <Button size="sm" variant="outline" className="h-8 bg-white" onClick={() => openBatchEdit(check, records)}>Batch categorise</Button>}</div></div><p className="mt-1 text-sm text-stone-600">{check.guidance}</p>
+                  {records.length > 0 && <div className="mt-3 max-h-80 space-y-2 overflow-y-auto">{records.map((item, index) => {
+                    const source = issueSource(item);
+                    const actionable = ["bank", "manual", "mileage"].includes(source);
+                    const actionLabel = check.code === "capital_items_review" ? "Review treatment" : check.code === "missing_receipts" ? "Attach receipt" : check.code.includes("duplicate") ? "Resolve duplicate" : "Review & fix";
+                    return <div key={`${item.id || check.code}-${index}`} className="flex flex-col gap-3 rounded-lg border border-stone-200 bg-stone-50 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0"><p className="truncate text-sm font-medium text-stone-800">{item.description || item.client || item.invoice_number || "Record"}</p><p className="mt-0.5 text-xs text-stone-500">{item.date || "No date"}{item.amount !== undefined ? ` · ${money(item.amount)}` : ""}{source === "manual" ? " · Manual expense" : source === "bank" ? " · Bank record" : source === "mileage" ? " · Mileage" : ""}</p>{item.equipment_review_status === "flag_capital" && <p className="mt-1 text-xs font-medium text-amber-700">Flagged for accountant/capital review</p>}</div>
+                      {actionable && !isClosed && <Button size="sm" variant="outline" className="shrink-0 bg-white" onClick={() => openIssueRecord(check, item)}><Pencil className="mr-2 h-3.5 w-3.5" />{actionLabel}</Button>}
+                      {isClosed && <Badge className="shrink-0 bg-stone-200 text-stone-700">Reopen year to change</Badge>}
+                    </div>;
+                  })}</div>}
+                </div></div></div>;
+            })}
           </div>}
         </CardContent>
       </Card>
@@ -273,6 +450,51 @@ export default function TaxPrep() {
         {history.length ? <div className="space-y-2">{history.map((item) => <div key={item.id} className="flex flex-col gap-1 rounded-lg bg-stone-50 p-3 text-sm sm:flex-row sm:items-center sm:justify-between"><div><span className="font-semibold capitalize text-stone-800">{item.action}</span><span className="text-stone-500"> · {item.reason}</span></div><span className="shrink-0 text-xs text-stone-400">{dateTime(item.created_at)}</span></div>)}</div> : <p className="text-sm text-stone-500">No close or reopen actions have been recorded yet.</p>}
         {isClosed && <div className="flex flex-col gap-2 border-t border-stone-100 pt-4 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs text-stone-500">Reopening is deliberately audited and never deletes the previously closed evidence pack.</p><Button variant="outline" className="text-amber-800" onClick={() => { resetDialog(); setReopenOpen(true); }}><RotateCcw className="mr-2 h-4 w-4" />Reopen with reason</Button></div>}
       </CardContent></Card>
+
+      <Dialog open={Boolean(issueAction)} onOpenChange={(open) => { if (!open) setIssueAction(null); }}>
+        <DialogContent className="max-h-[92vh] max-w-xl overflow-y-auto" data-testid="close-check-action-dialog">
+          <DialogHeader><DialogTitle>Review and resolve this record</DialogTitle><DialogDescription>{issueAction?.check?.title}</DialogDescription></DialogHeader>
+          {issueAction && <div className="space-y-4">
+            <div className="rounded-lg border border-stone-200 bg-stone-50 p-4">
+              <div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-stone-900">{issueAction.record.description || "Expense record"}</p><p className="mt-1 text-sm text-stone-500">{issueAction.record.date || "No date"} · {issueAction.source === "bank" ? "Bank statement" : "Manual expense"}</p></div><strong className="shrink-0 font-mono text-rose-700">{money(issueAction.record.amount)}</strong></div>
+            </div>
+
+            <div className="space-y-2"><Label>Expense category</Label><Select value={issueCategory} onValueChange={setIssueCategory} disabled={issueExcluded}><SelectTrigger><SelectValue placeholder="Choose the correct category" /></SelectTrigger><SelectContent>{EXPENSE_CATEGORIES.map((category) => <SelectItem key={category} value={category}>{category}</SelectItem>)}</SelectContent></Select></div>
+
+            <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-stone-200 p-3 text-sm"><Checkbox checked={issueExcluded} onCheckedChange={(value) => setIssueExcluded(value === true)} className="mt-0.5" /><span><strong className="block text-stone-800">Exclude from tax totals</strong><span className="text-stone-500">Use this only when the item is personal, a transfer, duplicated elsewhere, or should not form part of the business totals.</span></span></label>
+
+            {issueAction.source === "manual" && <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50/50 p-3 text-sm"><Checkbox checked={issuePaidPersonally} onCheckedChange={(value) => setIssuePaidPersonally(value === true)} className="mt-0.5" /><span><strong className="flex items-center gap-2 text-stone-800"><WalletCards className="h-4 w-4" />Paid personally / personal credit card</strong><span className="text-stone-500">Keep this genuine business expense in the totals without matching it to the business bank.</span></span></label>}
+
+            {issueAction.source === "manual" && !issueAction.record.receipt_file && <div className="space-y-2 rounded-lg border border-sky-200 bg-sky-50 p-3"><Label className="flex items-center gap-2"><Upload className="h-4 w-4" />Attach the missing receipt</Label><Input type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" onChange={(event) => setIssueReceipt(event.target.files?.[0] || null)} /><p className="text-xs text-sky-800">Optional: the original PDF or photograph will be included in the evidence pack.</p></div>}
+
+            {issueAction.record.bank_candidates?.length > 0 && issueAction.source === "manual" && <div className="space-y-2 rounded-lg border border-violet-200 bg-violet-50 p-3"><Label className="flex items-center gap-2"><Link2 className="h-4 w-4" />Link to the matching business-bank payment</Label><Select value={issueBankId} onValueChange={setIssueBankId}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none">Do not link</SelectItem>{issueAction.record.bank_candidates.map((candidate) => <SelectItem key={candidate.id} value={candidate.id}>{candidate.date} · {candidate.description} · {money(candidate.amount)}</SelectItem>)}</SelectContent></Select><p className="text-xs text-violet-800">Linking keeps this receipt as evidence but counts the bank payment only once.</p></div>}
+
+            {issueCategory === "Equipment & Gear" && <div className="space-y-3 rounded-lg border border-amber-200 bg-amber-50 p-3"><div><Label>Equipment review decision</Label><p className="mt-1 text-xs text-amber-800">This records your review; it does not make a tax decision for you.</p></div><Select value={issueEquipmentStatus} onValueChange={setIssueEquipmentStatus}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="unreviewed">Still needs review</SelectItem><SelectItem value="keep_current">Reviewed — keep current treatment</SelectItem><SelectItem value="flag_capital">Flag for accountant / capital review</SelectItem></SelectContent></Select><Textarea value={issueEquipmentNote} onChange={(event) => setIssueEquipmentNote(event.target.value)} placeholder="Optional private review note" /></div>}
+
+            <div className="flex flex-col-reverse gap-2 border-t border-stone-100 pt-4 sm:flex-row sm:justify-between">
+              {issueAction.check.code.includes("duplicate") ? <Button variant="outline" className="border-rose-200 text-rose-700 hover:bg-rose-50" disabled={working} onClick={deleteIssueRecord}><Trash2 className="mr-2 h-4 w-4" />Delete duplicate</Button> : <span />}
+              <div className="flex gap-2"><Button variant="outline" onClick={() => setIssueAction(null)}>Cancel</Button><Button disabled={working || (!issueExcluded && !issueCategory)} onClick={saveIssueRecord} className="bg-[#C7A76D] text-white hover:bg-[#B8985E]"><Receipt className="mr-2 h-4 w-4" />{working ? "Saving…" : "Save and recheck"}</Button></div>
+            </div>
+          </div>}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(batchAction)} onOpenChange={(open) => { if (!open) setBatchAction(null); }}>
+        <DialogContent className="max-h-[92vh] max-w-xl overflow-y-auto" data-testid="batch-expense-review-dialog">
+          <DialogHeader><DialogTitle>Batch categorise similar records</DialogTitle><DialogDescription>Select the records that belong in the same expense category. Nothing is deleted or excluded.</DialogDescription></DialogHeader>
+          {batchAction && <div className="space-y-4">
+            <div className="max-h-64 space-y-2 overflow-y-auto rounded-lg border border-stone-200 p-2">
+              {batchAction.records.map((record) => {
+                const key = `${issueSource(record)}:${record.id}`;
+                return <label key={key} className="flex cursor-pointer items-start gap-3 rounded-md p-2 hover:bg-stone-50"><Checkbox checked={batchSelected.includes(key)} onCheckedChange={() => toggleBatchRecord(key)} className="mt-1" /><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-stone-800">{record.description || "Expense"}</span><span className="text-xs text-stone-500">{record.date || "No date"} · {money(record.amount)} · {issueSource(record) === "bank" ? "Bank" : "Manual"}</span></span></label>;
+              })}
+            </div>
+            <div className="space-y-2"><Label>Apply this category to {batchSelected.length} selected record{batchSelected.length === 1 ? "" : "s"}</Label><Select value={batchCategory} onValueChange={setBatchCategory}><SelectTrigger><SelectValue placeholder="Choose the shared category" /></SelectTrigger><SelectContent>{EXPENSE_CATEGORIES.map((category) => <SelectItem key={category} value={category}>{category}</SelectItem>)}</SelectContent></Select></div>
+            {batchAction.records.some((record) => issueSource(record) === "manual") && <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50/50 p-3 text-sm"><Checkbox checked={batchPaidPersonally} onCheckedChange={(value) => setBatchPaidPersonally(value === true)} className="mt-0.5" /><span><strong className="block text-stone-800">Mark selected manual records as paid personally</strong><span className="text-stone-500">Leave unticked to preserve each record’s existing payment source.</span></span></label>}
+            <DialogFooter><Button variant="outline" onClick={() => setBatchAction(null)}>Cancel</Button><Button className="bg-[#C7A76D] text-white hover:bg-[#B8985E]" disabled={working || !batchCategory || batchSelected.length === 0} onClick={saveBatchEdit}>{working ? "Saving…" : `Update ${batchSelected.length} records`}</Button></DialogFooter>
+          </div>}
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={closeOpen} onOpenChange={(open) => { setCloseOpen(open); if (!open) resetDialog(); }}><DialogContent><DialogHeader><DialogTitle>Close tax year {taxYear}</DialogTitle><DialogDescription>This creates a permanent evidence pack and locks this year’s accounts records against accidental edits.</DialogDescription></DialogHeader><div className="space-y-4">
         <div className="space-y-2"><Label htmlFor="close-reason">Reason / close note</Label><Textarea id="close-reason" value={reason} onChange={(event) => setReason(event.target.value)} placeholder="For example: Year checked and ready for accountant" /></div>

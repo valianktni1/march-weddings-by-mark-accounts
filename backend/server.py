@@ -53,7 +53,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.19-paid-personally-expenses-v1.4.8"
+BUILD_ID = "2026.08.21-close-check-action-centre-v1.4.9"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -206,7 +206,7 @@ class ExpenseCreate(BaseModel):
 
 class ExpenseUpdate(BaseModel):
     description: str = Field(min_length=1, max_length=500)
-    category: str = Field(min_length=1, max_length=160)
+    category: Optional[str] = Field(default=None, max_length=160)
     supplier: Optional[str] = Field(default=None, max_length=200)
     include_in_totals: Optional[bool] = None
     paid_personally: Optional[bool] = None
@@ -354,6 +354,15 @@ class TransactionUpdate(BaseModel):
     transaction_type: str = Field(pattern="^(income|expense|owner_withdrawal|tax_payment)$")
     category: Optional[str] = Field(default=None, max_length=160)
     excluded_from_totals: bool = False
+
+
+class ExpenseBankLink(BaseModel):
+    transaction_id: str = Field(min_length=1, max_length=160)
+
+
+class EquipmentReviewUpdate(BaseModel):
+    status: str = Field(pattern="^(keep_current|flag_capital|unreviewed)$")
+    note: Optional[str] = Field(default=None, max_length=1000)
 
 
 def _expense_date_key(value: Optional[str]) -> datetime:
@@ -1199,6 +1208,68 @@ async def get_tax_year_close(tax_year: str):
     if isinstance(public_snapshot.get("booking_reconciliation"), dict):
         public_snapshot["booking_reconciliation"].pop("matched_rows", None)
     return {"close": _public_tax_year_close_state(close_state), "review": public_snapshot}
+
+
+@api_router.get("/tidy-up")
+async def get_historical_tidy_up():
+    """Summarise every populated tax year for the historical tidy-up dashboard."""
+
+    async def summarise(year: dict) -> dict:
+        tax_year = year["id"]
+        snapshot, state, transaction_count, expense_count, mileage_count = await asyncio.gather(
+            _tax_close_snapshot(tax_year),
+            _tax_year_close_state(tax_year),
+            db.transactions.count_documents({"tax_year": tax_year}),
+            db.expenses.count_documents({"tax_year": tax_year}),
+            db.mileage.count_documents({"tax_year": tax_year}),
+        )
+        validation = snapshot["validation"]
+        checks = validation.get("checks") or []
+        affected_keys = {
+            f"{record.get('source') or record.get('kind') or check['code']}:{record.get('id') or index}"
+            for check in checks
+            for index, record in enumerate(check.get("records") or check.get("examples") or [])
+        }
+        return {
+            "tax_year": tax_year,
+            "label": year["label"],
+            "status": state.get("status", "open"),
+            "activity_count": transaction_count + expense_count + mileage_count,
+            "transaction_count": transaction_count,
+            "expense_count": expense_count,
+            "mileage_count": mileage_count,
+            "blocker_count": validation.get("blocker_count", 0),
+            "warning_count": validation.get("warning_count", 0),
+            "affected_record_count": len(affected_keys),
+            "ready_to_close": bool(validation.get("ready_to_close")),
+            "checks": [
+                {
+                    "code": check["code"],
+                    "title": check["title"],
+                    "severity": check["severity"],
+                    "count": check["count"],
+                    "amount": check["amount"],
+                }
+                for check in checks
+            ],
+        }
+
+    years = await asyncio.gather(*(summarise(year) for year in UK_TAX_YEARS))
+    current_tax_year = get_tax_year_from_date(datetime.now().strftime("%d/%m/%Y"))
+    visible_years = [
+        year for year in years
+        if year["activity_count"] > 0 or year["status"] == "closed" or year["tax_year"] == current_tax_year
+    ]
+    return {
+        "current_tax_year": current_tax_year,
+        "years": visible_years,
+        "totals": {
+            "open_years": sum(1 for year in visible_years if year["status"] != "closed"),
+            "blockers": sum(year["blocker_count"] for year in visible_years),
+            "warnings": sum(year["warning_count"] for year in visible_years),
+            "affected_records": sum(year["affected_record_count"] for year in visible_years),
+        },
+    }
 
 
 @api_router.get("/tax-year-close/{tax_year}/history")
@@ -3181,6 +3252,121 @@ async def get_expense_ledger(tax_year: Optional[str] = None):
     return build_expense_ledger_rows(transactions, expenses)
 
 
+async def _expense_review_record(source: str, record_id: str) -> tuple[Any, dict]:
+    if source == "bank":
+        collection = db.transactions
+    elif source == "manual":
+        collection = db.expenses
+    else:
+        raise HTTPException(status_code=422, detail="Expense source must be bank or manual")
+    record = await collection.find_one({"id": record_id}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Expense record not found")
+    return collection, record
+
+
+@api_router.post("/expenses/{expense_id}/receipt")
+async def attach_expense_receipt(expense_id: str, request: Request, file: UploadFile = File(...)):
+    expense = await db.expenses.find_one({"id": expense_id}, {"_id": 0})
+    if not expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
+    await _assert_tax_year_open(expense.get("tax_year"))
+    if expense.get("file_path"):
+        raise HTTPException(status_code=409, detail="This expense already has an uploaded receipt")
+    content, file_ext, original_name = await _read_upload(file, {".pdf", ".png", ".jpg", ".jpeg", ".webp"})
+    file_path = UPLOAD_DIR / "expenses" / str(expense.get("tax_year") or "unassigned") / f"{uuid.uuid4()}{file_ext}"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, "wb") as output:
+        output.write(content)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.expenses.update_one({"id": expense_id}, {"$set": {
+        "file_path": str(file_path), "file_name": original_name, "updated_at": now_iso,
+    }})
+    await db.expense_review_audit.insert_one({
+        "id": str(uuid.uuid4()), "tax_year": expense.get("tax_year"), "record_id": expense_id,
+        "source": "manual", "action": "receipt_attached", "file_name": original_name,
+        "admin_email": _admin_from_request(request), "created_at": now_iso,
+    })
+    return {"status": "attached", "file_name": original_name}
+
+
+@api_router.post("/tax-year-close/{tax_year}/expenses/{expense_id}/link-bank")
+async def link_manual_expense_to_bank(
+    tax_year: str, expense_id: str, payload: ExpenseBankLink, request: Request,
+):
+    await _assert_tax_year_open(tax_year)
+    expense = await db.expenses.find_one({"id": expense_id}, {"_id": 0})
+    transaction = await db.transactions.find_one({"id": payload.transaction_id}, {"_id": 0})
+    if not expense:
+        raise HTTPException(status_code=404, detail="Manual expense not found")
+    if not transaction or transaction.get("transaction_type") != "expense":
+        raise HTTPException(status_code=404, detail="Bank expense not found")
+    if expense.get("tax_year") != tax_year or transaction.get("tax_year") != tax_year:
+        raise HTTPException(status_code=409, detail="Both records must belong to the selected tax year")
+    if expense.get("source_transaction_id") or expense.get("is_from_bank"):
+        raise HTTPException(status_code=409, detail="This manual expense is already linked to a bank payment")
+    existing_link = await db.expenses.find_one({
+        "source_transaction_id": payload.transaction_id,
+        "is_from_bank": True,
+    }, {"_id": 0, "id": 1})
+    if existing_link:
+        raise HTTPException(status_code=409, detail="That bank payment already has a linked receipt record")
+    if (
+        format_date_uk(expense.get("date")) != format_date_uk(transaction.get("date"))
+        or round(abs(float(expense.get("amount") or 0)), 2) != round(abs(float(transaction.get("amount") or 0)), 2)
+    ):
+        raise HTTPException(status_code=409, detail="The date and amount must match before these records can be linked")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updates = {
+        "source_transaction_id": payload.transaction_id,
+        "is_from_bank": True,
+        "include_in_totals": False,
+        "updated_at": now_iso,
+    }
+    if not expense.get("category") and transaction.get("category"):
+        updates["category"] = transaction.get("category")
+    await db.expenses.update_one({"id": expense_id}, {"$set": updates})
+    await db.expense_review_audit.insert_one({
+        "id": str(uuid.uuid4()), "tax_year": tax_year, "record_id": expense_id,
+        "source": "manual", "action": "linked_to_bank", "bank_transaction_id": payload.transaction_id,
+        "admin_email": _admin_from_request(request), "created_at": now_iso,
+    })
+    return {"status": "linked", "expense_id": expense_id, "transaction_id": payload.transaction_id}
+
+
+@api_router.put("/tax-year-close/{tax_year}/expense-records/{source}/{record_id}/equipment-review")
+async def review_equipment_record(
+    tax_year: str, source: str, record_id: str, payload: EquipmentReviewUpdate, request: Request,
+):
+    await _assert_tax_year_open(tax_year)
+    collection, record = await _expense_review_record(source, record_id)
+    if record.get("tax_year") != tax_year:
+        raise HTTPException(status_code=409, detail="This record belongs to a different tax year")
+    if record.get("category") != "Equipment & Gear":
+        raise HTTPException(status_code=409, detail="Only Equipment & Gear records can use this review")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if payload.status == "unreviewed":
+        await collection.update_one({"id": record_id}, {"$unset": {"equipment_review": ""}, "$set": {"updated_at": now_iso}})
+    else:
+        await collection.update_one({"id": record_id}, {"$set": {
+            "equipment_review": {
+                "status": payload.status,
+                "note": (payload.note or "").strip(),
+                "reviewed_at": now_iso,
+                "reviewed_by": _admin_from_request(request),
+            },
+            "updated_at": now_iso,
+        }})
+    await db.expense_review_audit.insert_one({
+        "id": str(uuid.uuid4()), "tax_year": tax_year, "record_id": record_id,
+        "source": source, "action": "equipment_review", "status": payload.status,
+        "note": (payload.note or "").strip(), "admin_email": _admin_from_request(request),
+        "created_at": now_iso,
+    })
+    return {"status": payload.status, "record_id": record_id}
+
+
 @api_router.put("/expenses/{expense_id}")
 async def update_expense(expense_id: str, payload: ExpenseUpdate):
     expense = await db.expenses.find_one({"id": expense_id}, {"_id": 0})
@@ -3194,11 +3380,13 @@ async def update_expense(expense_id: str, payload: ExpenseUpdate):
     await _assert_tax_year_open(expense.get("tax_year"))
     updates = {
         "description": payload.description.strip(),
-        "category": payload.category.strip(),
+        "category": (payload.category or "").strip() or None,
         "supplier": (payload.supplier or "").strip() or None,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if payload.include_in_totals is not None:
+        if payload.include_in_totals and not updates["category"]:
+            raise HTTPException(status_code=422, detail="Choose a category for an included expense")
         updates["include_in_totals"] = payload.include_in_totals
     if payload.paid_personally is not None:
         updates["paid_personally"] = payload.paid_personally
@@ -3988,6 +4176,7 @@ BACKUP_COLLECTIONS = [
     "cash_payment_audit",
     "booking_bank_matches",
     "booking_bank_match_audit",
+    "expense_review_audit",
     "migration_audits",
 ]
 BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
@@ -4263,6 +4452,10 @@ async def startup_checks():
     await db.booking_bank_match_audit.create_index(
         [("tax_year", 1), ("created_at", -1)],
         name="combined_bank_match_audit_history",
+    )
+    await db.expense_review_audit.create_index(
+        [("tax_year", 1), ("created_at", -1)],
+        name="expense_review_audit_history",
     )
 
 

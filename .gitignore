@@ -27,6 +27,7 @@ backend/V:*/
 *_backup_*.zip
 *.dump
 *.archive.gz
+/.qa-*
 
 # Editors / OS
 .DS_Store
