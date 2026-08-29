@@ -1,10 +1,13 @@
 # Weddings By Mark Accounts 2026
 
+Current build: `2026.08.28-booking-invoice-recreation-v1.5.0.3`
+
 Independent, self-hosted accounts manager for Weddings By Mark. This is a secured successor to the existing application and has no Emergent runtime dependency.
 
 ## Included
 
 - Invoices and payment tracking
+- Reviewed BookingSystem PDFs recreated under the next Accounts number without retaining the original source PDF
 - Expenses, receipts and recurring expenses
 - Personally paid business expenses that stay in tax totals without false bank-duplicate blocks
 - Close Checks Action Centre with direct record fixes and receipt-to-bank linking
@@ -16,6 +19,7 @@ Independent, self-hosted accounts manager for Weddings By Mark. This is a secure
 - Tide CSV and optional direct Gemini bank-statement parsing
 - Bank transactions and UK tax-year summaries
 - Complete backup and restore of all records and uploaded files
+- Accountant evidence packs that include Accounts-owned invoices while excluding BookingSystem invoice PDFs
 - Administrator login, signed sessions, CSRF protection and login throttling
 - Disabled-by-default booking-system integration API
 - Responsive mobile and desktop navigation

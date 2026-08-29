@@ -1,0 +1,44 @@
+ACCOUNTS V1.5.0.3 - TRUENAS DEPLOYMENT
+=====================================
+
+1. Extract this complete release and upload its contents to the main branch of:
+   https://github.com/valianktni1/march-weddings-by-mark-accounts
+
+2. In the TrueNAS shell, run these commands exactly:
+
+cd /mnt/apps/dockge/data/accounts-2026-use
+
+ACCOUNTS_BACKUP="/mnt/apps/dockge/data/accounts-2026-use/accounts-before-v1503-$(date +%Y%m%d-%H%M%S).archive"
+
+docker exec accounts-2026-db sh -lc \
+  'mongodump --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --db weddings_by_mark_accounts_2026 --archive' \
+  > "$ACCOUNTS_BACKUP"
+
+ls -lh "$ACCOUNTS_BACKUP"
+
+ACCOUNTS_COMPOSE=/mnt/apps/dockge/data/accounts-2026-use/compose.yaml
+
+docker compose -f "$ACCOUNTS_COMPOSE" build --no-cache backend frontend
+docker compose -f "$ACCOUNTS_COMPOSE" up -d backend frontend
+
+docker compose -f "$ACCOUNTS_COMPOSE" ps
+curl -fsS http://127.0.0.1:30053/api/health
+echo
+
+Expected build:
+2026.08.28-booking-invoice-recreation-v1.5.0.3
+
+AFTER DEPLOYMENT
+----------------
+1. Reopen Accounts and upload WBM01208.pdf again.
+2. Review Rebecca & Adam's extracted details.
+3. Press Create Accounts Invoice.
+4. Confirm the new record receives the next free Accounts number, not WBM01208.
+
+IMPORTANT
+---------
+- Keep BOOKING_INTEGRATION_ENABLED set to "false".
+- No database migration command is required.
+- Accounts stores only the recreated, renumbered invoice PDF; it does not store the original BookingSystem PDF.
+- Genuine repeat imports remain blocked by retained source-number and fingerprint metadata.
+- Tax-year evidence packs include only Accounts-owned invoice PDFs; BookingSystem-linked originals and legacy source-PDF paths are excluded.

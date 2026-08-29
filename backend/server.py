@@ -55,7 +55,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.21-cash-flow-navigation-round-trip-v1.5.0.1"
+BUILD_ID = "2026.08.28-booking-invoice-recreation-v1.5.0.3"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -1168,6 +1168,17 @@ def _safe_evidence_source(file_path: Any) -> Optional[Path]:
     return source if source.is_file() else None
 
 
+def _accounts_invoice_evidence_source(record: dict) -> Optional[Path]:
+    """Return only an Accounts-owned invoice PDF for the accountant pack."""
+    if record.get("source_system") == "booking_system":
+        return None
+    source = _safe_evidence_source(record.get("file_path"))
+    if source and "source-booking-pdfs" in source.parts:
+        logger.warning("Tax pack rejected a Booking source PDF path: %s", source)
+        return None
+    return source
+
+
 async def _tax_pack_evidence(snapshot: dict) -> list[dict]:
     evidence: list[dict] = []
     expenses_by_id = {
@@ -1200,8 +1211,10 @@ async def _tax_pack_evidence(snapshot: dict) -> list[dict]:
     invoice_ids = {row.get("invoice_id") for row in snapshot.get("invoice_payment_audit", []) if row.get("invoice_id")}
     invoices = await db.invoices.find({"id": {"$in": list(invoice_ids)}}, {"_id": 0}).to_list(100000) if invoice_ids else []
     for record in invoices:
+        if record.get("source_system") == "booking_system":
+            continue
         record = await _ensure_invoice_pdf_current(record)
-        source = _safe_evidence_source(record.get("file_path"))
+        source = _accounts_invoice_evidence_source(record)
         if source:
             evidence.append({
                 "category": "invoices",
@@ -1835,6 +1848,81 @@ async def scan_invoice_pdf(file: UploadFile = File(...)):
     return result
 
 
+async def _find_manual_pdf_duplicate(invoices, source_invoice_number: str, source_pdf_sha256: str):
+    """Find the same source document without confusing the two WBM namespaces."""
+    duplicate = await invoices.find_one(
+        {
+            "source_system": "manual_pdf_import",
+            "$or": [
+                {"source_invoice_number": source_invoice_number},
+                {"source_pdf_sha256": source_pdf_sha256},
+            ],
+        },
+        {"_id": 0, "invoice_number": 1, "source_invoice_number": 1},
+    )
+    if not duplicate:
+        # V1.4.6 retained the source number only in invoice_number. Keep that
+        # one legacy duplicate safeguard without confusing a later Accounts
+        # number with a new BookingSystem source number of the same value.
+        legacy_candidate = await invoices.find_one(
+            {
+                "source_system": "manual_pdf_import",
+                "invoice_number": source_invoice_number,
+            },
+            {"_id": 0, "invoice_number": 1, "source_invoice_number": 1},
+        )
+        if legacy_candidate and not str(legacy_candidate.get("source_invoice_number") or "").strip():
+            duplicate = legacy_candidate
+    return duplicate
+
+
+async def _remove_manual_import_source_pdf_copies() -> int:
+    """Remove redundant Booking PDF copies while retaining duplicate evidence."""
+    rows = await db.invoices.find(
+        {
+            "source_system": "manual_pdf_import",
+            "source_pdf_path": {"$type": "string"},
+        },
+        {"_id": 0, "source_pdf_path": 1},
+    ).to_list(10000)
+    removed = 0
+    for row in rows:
+        source_pdf_path = str(row.get("source_pdf_path") or "").strip()
+        if not source_pdf_path:
+            continue
+        try:
+            deleted = _delete_managed_upload(source_pdf_path)
+            if not deleted and Path(source_pdf_path).exists():
+                logger.warning("Booking source PDF could not be removed: %s", source_pdf_path)
+                continue
+        except Exception:
+            logger.exception("Booking source PDF could not be removed: %s", source_pdf_path)
+            continue
+        await db.invoices.update_one(
+            {
+                "source_system": "manual_pdf_import",
+                "source_pdf_path": source_pdf_path,
+            },
+            {
+                "$unset": {
+                    "source_pdf_path": "",
+                    "source_pdf_preserved": "",
+                },
+                "$set": {
+                    "source_pdf_removed_at": datetime.now(timezone.utc).isoformat(),
+                },
+            },
+        )
+        removed += 1
+
+    source_dir = UPLOAD_DIR / "invoices" / "source-booking-pdfs"
+    try:
+        source_dir.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+    return removed
+
+
 @api_router.post("/invoices/import-pdf")
 async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = File(...)):
     """Recreate one reviewed Booking PDF under the next Accounts invoice number."""
@@ -1867,15 +1955,8 @@ async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = F
             detail=f'The PDF is {parsed.get("invoice_number") or "missing its number"}, not {source_invoice_number}',
         )
     source_pdf_sha256 = hashlib.sha256(content).hexdigest()
-    duplicate = await db.invoices.find_one(
-        {
-            "$or": [
-                {"source_system": "manual_pdf_import", "source_invoice_number": source_invoice_number},
-                {"source_system": "manual_pdf_import", "invoice_number": source_invoice_number},
-                {"source_system": "manual_pdf_import", "source_pdf_sha256": source_pdf_sha256},
-            ]
-        },
-        {"_id": 0, "invoice_number": 1},
+    duplicate = await _find_manual_pdf_duplicate(
+        db.invoices, source_invoice_number, source_pdf_sha256
     )
     if duplicate:
         raise HTTPException(
@@ -1906,25 +1987,15 @@ async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = F
 
     pdf_dir = UPLOAD_DIR / "invoices"
     pdf_dir.mkdir(parents=True, exist_ok=True)
-    source_dir = pdf_dir / "source-booking-pdfs"
-    source_dir.mkdir(parents=True, exist_ok=True)
-
     invoice_number = await allocate_next_invoice_number()
     pdf_path = pdf_dir / f"{invoice_number}.pdf"
-    source_pdf_path = source_dir / f"{source_invoice_number}-{source_pdf_sha256[:12]}.pdf"
     if pdf_path.exists():
         raise HTTPException(status_code=409, detail=f"A stored PDF already exists for {invoice_number}")
 
-    source_pdf_created = False
     try:
         recreate_booking_invoice_pdf(content, source_invoice_number, invoice_number, pdf_path)
-        if not source_pdf_path.exists():
-            source_pdf_path.write_bytes(content)
-            source_pdf_created = True
     except Exception as exc:
         pdf_path.unlink(missing_ok=True)
-        if source_pdf_created:
-            source_pdf_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="The Accounts copy of the PDF could not be created") from exc
 
     invoice_data = {
@@ -1959,9 +2030,7 @@ async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = F
         "original_file_name": original_name,
         "source_system": "manual_pdf_import",
         "source_invoice_number": source_invoice_number,
-        "source_pdf_path": str(source_pdf_path),
         "source_pdf_sha256": source_pdf_sha256,
-        "source_pdf_preserved": True,
         "source_pdf_recreated": True,
         "imported_at": datetime.now(timezone.utc).isoformat(),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1970,13 +2039,9 @@ async def import_invoice_pdf(invoice_json: str = Form(...), file: UploadFile = F
         await db.invoices.insert_one(invoice_data)
     except DuplicateKeyError as exc:
         pdf_path.unlink(missing_ok=True)
-        if source_pdf_created:
-            source_pdf_path.unlink(missing_ok=True)
         raise HTTPException(status_code=409, detail="That Booking invoice has already been imported") from exc
     except Exception:
         pdf_path.unlink(missing_ok=True)
-        if source_pdf_created:
-            source_pdf_path.unlink(missing_ok=True)
         raise
     invoice_data.pop("_id", None)
     return _public_invoice(invoice_data)
@@ -2041,6 +2106,11 @@ def recreate_booking_invoice_pdf(content: bytes, source_number: str, accounts_nu
 
     replacements = 0
     with pymupdf.open(stream=content, filetype="pdf") as doc:
+        metadata = dict(doc.metadata or {})
+        for key in ("title", "subject", "keywords"):
+            if source_number in str(metadata.get(key) or ""):
+                metadata[key] = str(metadata[key]).replace(source_number, accounts_number)
+        doc.set_metadata(metadata)
         for page in doc:
             spans = [
                 span
@@ -2088,7 +2158,12 @@ def recreate_booking_invoice_pdf(content: bytes, source_number: str, accounts_nu
 
     with pymupdf.open(str(output_path)) as recreated:
         recreated_text = "\n".join(page.get_text() for page in recreated)
-    if source_number in recreated_text or accounts_number not in recreated_text:
+        recreated_title = str((recreated.metadata or {}).get("title") or "")
+    if (
+        source_number in recreated_text
+        or source_number in recreated_title
+        or accounts_number not in recreated_text
+    ):
         output_path.unlink(missing_ok=True)
         raise ValueError("The recreated invoice number could not be verified")
     return replacements
@@ -4557,6 +4632,13 @@ async def startup_checks():
             raise RuntimeError("Wildcard CORS is not permitted in production")
     if INTEGRATION_ENABLED and len(INTEGRATION_KEY) < 32:
         raise RuntimeError("BOOKING_INTEGRATION_KEY must be at least 32 characters when enabled")
+
+    removed_source_pdfs = await _remove_manual_import_source_pdf_copies()
+    if removed_source_pdfs:
+        logger.info(
+            "Removed %s redundant Booking invoice source PDF copy/copies",
+            removed_source_pdfs,
+        )
 
     await db.invoices.create_index(
         [("source_system", 1), ("source_invoice_id", 1)],

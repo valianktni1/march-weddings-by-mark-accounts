@@ -1,4 +1,6 @@
 import importlib
+import asyncio
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -115,6 +117,119 @@ def test_public_invoice_hides_private_source_evidence_fields():
     assert public == {"invoice_number": "WBM01110"}
 
 
+def test_manual_import_duplicate_check_allows_accounts_number_source_collision():
+    class FakeInvoices:
+        def __init__(self):
+            self.queries = []
+
+        async def find_one(self, query, projection=None):
+            self.queries.append(query)
+            if "$or" in query:
+                return None
+            return {
+                "invoice_number": "WBM01208",
+                "source_invoice_number": "WBM02577",
+            }
+
+    fake = FakeInvoices()
+
+    duplicate = asyncio.run(
+        server._find_manual_pdf_duplicate(fake, "WBM01208", "new-pdf-hash")
+    )
+
+    assert duplicate is None
+    assert fake.queries[1]["invoice_number"] == "WBM01208"
+
+
+def test_manual_import_duplicate_check_keeps_v146_legacy_protection():
+    class FakeInvoices:
+        async def find_one(self, query, projection=None):
+            if "$or" in query:
+                return None
+            return {"invoice_number": "WBM01205"}
+
+    duplicate = asyncio.run(
+        server._find_manual_pdf_duplicate(FakeInvoices(), "WBM01205", "changed-pdf-hash")
+    )
+
+    assert duplicate == {"invoice_number": "WBM01205"}
+
+
+def test_manual_import_duplicate_check_blocks_same_retained_source_number():
+    class FakeInvoices:
+        async def find_one(self, query, projection=None):
+            return {
+                "invoice_number": "WBM01207",
+                "source_invoice_number": "WBM02577",
+            }
+
+    duplicate = asyncio.run(
+        server._find_manual_pdf_duplicate(FakeInvoices(), "WBM02577", "new-pdf-hash")
+    )
+
+    assert duplicate["invoice_number"] == "WBM01207"
+
+
+def test_manual_import_keeps_duplicate_metadata_but_not_source_pdf_bytes():
+    source = inspect.getsource(server.import_invoice_pdf)
+
+    assert '"source_invoice_number": source_invoice_number' in source
+    assert '"source_pdf_sha256": source_pdf_sha256' in source
+    assert "source_pdf_path" not in source
+    assert "source_pdf_preserved" not in source
+    assert "source-booking-pdfs" not in source
+
+
+def test_existing_manual_source_pdf_copies_are_removed(monkeypatch):
+    class FakeCursor:
+        async def to_list(self, _limit):
+            return [{"source_pdf_path": "/managed/uploads/source.pdf"}]
+
+    class FakeInvoices:
+        def __init__(self):
+            self.update = None
+
+        def find(self, query, projection=None):
+            return FakeCursor()
+
+        async def update_one(self, query, update):
+            self.update = (query, update)
+
+    fake_invoices = FakeInvoices()
+    monkeypatch.setattr(server.db, "invoices", fake_invoices)
+    monkeypatch.setattr(server, "_delete_managed_upload", lambda _path: True)
+
+    removed = asyncio.run(server._remove_manual_import_source_pdf_copies())
+
+    assert removed == 1
+    assert fake_invoices.update[0]["source_pdf_path"] == "/managed/uploads/source.pdf"
+    assert "source_pdf_path" in fake_invoices.update[1]["$unset"]
+    assert "source_pdf_sha256" not in fake_invoices.update[1]["$unset"]
+
+
+def test_tax_pack_accepts_accounts_copy_and_rejects_booking_originals(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path)
+    accounts_pdf = tmp_path / "invoices" / "WBM01211.pdf"
+    accounts_pdf.parent.mkdir(parents=True)
+    accounts_pdf.write_bytes(b"%PDF-accounts-copy")
+    booking_source = tmp_path / "invoices" / "source-booking-pdfs" / "WBM01208.pdf"
+    booking_source.parent.mkdir(parents=True)
+    booking_source.write_bytes(b"%PDF-booking-source")
+
+    assert server._accounts_invoice_evidence_source({
+        "source_system": "manual_pdf_import",
+        "file_path": str(accounts_pdf),
+    }) == accounts_pdf
+    assert server._accounts_invoice_evidence_source({
+        "source_system": "booking_system",
+        "file_path": str(accounts_pdf),
+    }) is None
+    assert server._accounts_invoice_evidence_source({
+        "source_system": "manual_pdf_import",
+        "file_path": str(booking_source),
+    }) is None
+
+
 def test_recreated_pdf_keeps_layout_and_replaces_every_source_number(tmp_path):
     import pymupdf
 
@@ -126,6 +241,7 @@ def test_recreated_pdf_keeps_layout_and_replaces_every_source_number(tmp_path):
     first.insert_text((150, 90), source_number, fontsize=9)
     second = source.new_page()
     second.insert_text((72, 90), f"Please use {source_number} as your reference.", fontsize=9)
+    source.set_metadata({"title": source_number})
     source_bytes = source.tobytes()
     source.close()
     output = tmp_path / f"{accounts_number}.pdf"
@@ -138,5 +254,6 @@ def test_recreated_pdf_keeps_layout_and_replaces_every_source_number(tmp_path):
     with pymupdf.open(output) as recreated:
         text = "\n".join(page.get_text() for page in recreated)
         assert len(recreated) == 2
+        assert recreated.metadata["title"] == accounts_number
     assert source_number not in text
     assert text.count(accounts_number) == 2
