@@ -72,6 +72,7 @@ def test_booking_invoice_parser_extracts_number_money_dates_and_full_items():
     assert result["couple_names"] == "Example Couple"
     assert result["client_email"] == "couple@example.com"
     assert result["client_phone"] == "07000000000"
+    assert result["client_address"] == "14 Example Close, Manchester, M22 5SS"
     assert result["total_price"] == 630.0
     assert result["deposit_amount"] == 100.0
     assert result["balance_remaining"] == 530.0
@@ -84,6 +85,58 @@ def test_booking_invoice_parser_extracts_number_money_dates_and_full_items():
     assert result["line_items"][1]["amount"] == 155.0
     assert "Bronze Package 1" in result["notes"]
     assert "2 extra hours" in result["notes"]
+
+
+def redesigned_invoice_text(address="", split_metadata=False):
+    """Synthetic fixture with the text order observed in the redesigned PDF.
+
+    Deliberately contains no real client contact details.
+    """
+    text = BOOKING_INVOICE_TEXT
+    metadata = "\n".join(text.splitlines()[4:9]) + "\n"
+    text = text.replace(metadata, "")
+    if split_metadata:
+        metadata = metadata.replace("   ", "\n")
+    return text.replace(
+        "14 Example Close, Manchester, M22 5SS\nDESCRIPTION",
+        (address + "\n" if address else "") + metadata + "DESCRIPTION",
+    )
+
+
+def test_redesigned_invoice_without_address_does_not_import_metadata_as_address():
+    result = server.parse_booking_invoice_text(redesigned_invoice_text())
+    assert result["client_address"] == ""
+    assert result["couple_names"] == "Example Couple"
+    assert result["client_email"] == "couple@example.com"
+    assert result["client_phone"] == "07000000000"
+    assert result["invoice_number"] == "WBM01205"
+    assert result["wedding_date"] == "15/05/2027"
+    assert result["total_price"] == 630
+    assert result["deposit_amount"] == 100
+    assert result["balance_remaining"] == 530
+    assert len(result["line_items"]) == 2
+    assert result["ready_for_review"] is True
+    assert any("address has been left blank" in warning for warning in result["warnings"])
+
+
+def test_redesigned_invoice_preserves_multiline_address_before_metadata():
+    result = server.parse_booking_invoice_text(
+        redesigned_invoice_text("14 Example Close\nManchester\nM22 5SS")
+    )
+    assert result["client_address"] == "14 Example Close, Manchester, M22 5SS"
+    assert not any("address has been left blank" in warning for warning in result["warnings"])
+
+
+def test_split_metadata_labels_and_values_are_not_address_lines():
+    result = server.parse_booking_invoice_text(redesigned_invoice_text(split_metadata=True))
+    assert result["client_address"] == ""
+
+
+def test_redesigned_invoice_rejoins_postcode_wrapped_across_pdf_lines():
+    result = server.parse_booking_invoice_text(
+        redesigned_invoice_text("14 Example Close, Manchester, Greater Manchester, M22\n5SS")
+    )
+    assert result["client_address"] == "14 Example Close, Manchester, Greater Manchester, M22 5SS"
 
 
 def test_frontend_requires_review_before_manual_pdf_import():
