@@ -1,0 +1,56 @@
+ACCOUNTS V1.5.0.4 — PDF ADDRESS IMPORT
+
+GitHub main was verified against the supplied v1.5.0.3 base before applying
+this targeted update. Existing manual upload and renumbering are preserved.
+No database migration is required. No frontend build is required.
+
+Run each block in the TrueNAS shell as root/sudo with Docker access.
+The backup pauses the Accounts backend briefly so records and files agree.
+Backups contain confidential financial data; the folder permissions are private.
+
+1. BACK UP DATABASE, FILES AND COMPOSE CONFIGURATION
+
+bash <<'ACCOUNTS_BACKUP_SCRIPT'
+set -euo pipefail
+umask 077
+cd /mnt/apps/dockge/data/accounts-2026-use
+ACCOUNTS_BACKUP_DIR="$PWD/pre-v1504-$(date +%Y%m%d-%H%M%S)"
+mkdir -m 700 "$ACCOUNTS_BACKUP_DIR"
+cp compose.yaml "$ACCOUNTS_BACKUP_DIR/compose.yaml"
+docker inspect --format '{{.Image}}' accounts-2026-backend > "$ACCOUNTS_BACKUP_DIR/backend-image-id.txt"
+docker tag "$(cat "$ACCOUNTS_BACKUP_DIR/backend-image-id.txt")" accounts-2026-backend:before-v1504
+docker compose -f compose.yaml stop backend
+trap 'docker compose -f compose.yaml start backend' EXIT
+docker exec accounts-2026-db sh -lc 'mongodump --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --db weddings_by_mark_accounts_2026 --archive --gzip' > "$ACCOUNTS_BACKUP_DIR/database.archive.gz"
+test -s "$ACCOUNTS_BACKUP_DIR/database.archive.gz"
+gzip -t "$ACCOUNTS_BACKUP_DIR/database.archive.gz"
+tar -C /mnt/nextcloud/accounts-2026-saved-data --exclude=./backups --exclude=./temp_restore -czf "$ACCOUNTS_BACKUP_DIR/accounts-files.tar.gz" .
+tar -tzf "$ACCOUNTS_BACKUP_DIR/accounts-files.tar.gz" > /dev/null
+docker compose -f compose.yaml start backend
+trap - EXIT
+printf '\nBackup complete: %s\n' "$ACCOUNTS_BACKUP_DIR"
+ls -lh "$ACCOUNTS_BACKUP_DIR"
+ACCOUNTS_BACKUP_SCRIPT
+
+Only continue when the first block finishes with Backup complete.
+Existing application-generated backup ZIPs and temporary restore files are
+excluded from the file archive; uploads and year-end evidence packs are included.
+Archive checks verify readability, not a full database restore rehearsal.
+
+2. BUILD AND DEPLOY THE UPDATED BACKEND
+
+bash <<'ACCOUNTS_DEPLOY_SCRIPT'
+set -euo pipefail
+cd /mnt/apps/dockge/data/accounts-2026-use
+docker compose -f compose.yaml build --no-cache backend
+docker compose -f compose.yaml up -d --no-deps --force-recreate backend
+docker compose -f compose.yaml restart frontend
+docker compose -f compose.yaml ps
+curl --fail --silent --show-error --retry 20 --retry-delay 3 --retry-all-errors http://127.0.0.1:30053/api/health
+printf '\n'
+ACCOUNTS_DEPLOY_SCRIPT
+
+Expected build: 2026.10.29-invoice-address-import-v1.5.0.4
+
+Open Accounts and preview a PDF upload to verify the address. Do not save a
+second copy of an existing invoice solely to test this update.
