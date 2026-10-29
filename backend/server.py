@@ -55,7 +55,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.08.28-booking-invoice-recreation-v1.5.0.3"
+BUILD_ID = "2026.10.29-invoice-address-import-v1.5.0.4"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -1708,7 +1708,7 @@ def parse_booking_invoice_text(text: str) -> dict:
         "notes": "",
         "line_items": [],
         "warnings": [],
-        "parser": "bookingsystem2026-native-v1",
+        "parser": "bookingsystem2026-native-v2",
     }
 
     def labelled(label: str) -> str:
@@ -1751,8 +1751,27 @@ def parse_booking_invoice_text(text: str) -> dict:
         after_email = client_lines[client_email_index + 1:]
         if after_email and re.fullmatch(r"[+\d][\d\s()-]{7,}", after_email[0]):
             result["client_phone"] = re.sub(r"\s+", "", after_email.pop(0))
-        if after_email:
-            result["client_address"] = ", ".join(after_email)
+        # PDF text order follows drawing order, not the visible columns. The
+        # redesigned invoice emits its right-hand metadata after the client's
+        # contact details, including when no client address is printed. Stop
+        # at that column rather than treating invoice dates as address lines.
+        address_lines = []
+        for candidate in after_email:
+            if metadata.match(candidate) or re.match(
+                r"^(?:INVOICE\b|WBM\d{4,8}\s*\|\s*Page\b)", candidate, re.IGNORECASE
+            ):
+                break
+            address_lines.append(candidate)
+        result["client_address"] = re.sub(
+            r"\b([A-Z]{1,2}\d[A-Z\d]?)\s*,\s*(\d[A-Z]{2})\b",
+            r"\1 \2",
+            ", ".join(address_lines),
+            flags=re.IGNORECASE,
+        )
+        if not address_lines:
+            result["warnings"].append(
+                "No customer address was found in the PDF; the address has been left blank for review."
+            )
 
     def amount_after(label: str) -> float:
         match = re.search(rf"(?im)^\s*{label}\s*$\s*^\s*£([\d,]+(?:\.\d{{1,2}})?)\s*$", text)
