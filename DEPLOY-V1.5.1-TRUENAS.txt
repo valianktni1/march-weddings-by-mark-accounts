@@ -1,0 +1,60 @@
+ACCOUNTS V1.5.1 — HMRC SANDBOX WORKSPACE
+
+Includes the v1.5.0.4 address fix. Manual upload and renumbering are preserved.
+Both backend and frontend must be rebuilt. The HMRC test connection is disabled
+until you configure it. There is no production filing mode.
+No manual database migration is required; startup adds HMRC audit indexes.
+
+Run each block in the TrueNAS shell as root/sudo with Docker access.
+The backup pauses the Accounts backend briefly so records and files agree.
+Backups contain confidential financial data; the folder permissions are private.
+
+1. BACK UP DATABASE, FILES AND COMPOSE CONFIGURATION
+
+bash <<'ACCOUNTS_BACKUP_SCRIPT'
+set -euo pipefail
+umask 077
+cd /mnt/apps/dockge/data/accounts-2026-use
+ACCOUNTS_BACKUP_DIR="$PWD/pre-v151-$(date +%Y%m%d-%H%M%S)"
+mkdir -m 700 "$ACCOUNTS_BACKUP_DIR"
+cp compose.yaml "$ACCOUNTS_BACKUP_DIR/compose.yaml"
+if [ -f .env ]; then cp .env "$ACCOUNTS_BACKUP_DIR/stack.env"; fi
+docker inspect --format '{{.Image}}' accounts-2026-backend > "$ACCOUNTS_BACKUP_DIR/backend-image-id.txt"
+docker tag "$(cat "$ACCOUNTS_BACKUP_DIR/backend-image-id.txt")" accounts-2026-backend:before-v151
+docker compose -f compose.yaml stop backend
+trap 'docker compose -f compose.yaml start backend' EXIT
+docker exec accounts-2026-db sh -lc 'mongodump --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --db weddings_by_mark_accounts_2026 --archive --gzip' > "$ACCOUNTS_BACKUP_DIR/database.archive.gz"
+test -s "$ACCOUNTS_BACKUP_DIR/database.archive.gz"
+gzip -t "$ACCOUNTS_BACKUP_DIR/database.archive.gz"
+tar -C /mnt/nextcloud/accounts-2026-saved-data --exclude=./backups --exclude=./temp_restore -czf "$ACCOUNTS_BACKUP_DIR/accounts-files.tar.gz" .
+tar -tzf "$ACCOUNTS_BACKUP_DIR/accounts-files.tar.gz" > /dev/null
+docker compose -f compose.yaml start backend
+trap - EXIT
+printf '\nBackup complete: %s\n' "$ACCOUNTS_BACKUP_DIR"
+ls -lh "$ACCOUNTS_BACKUP_DIR"
+ACCOUNTS_BACKUP_SCRIPT
+
+Only continue when the first block finishes with Backup complete.
+Existing application-generated backup ZIPs and temporary restore files are
+excluded from the file archive; uploads and year-end evidence packs are included.
+Archive checks verify readability, not a full database restore rehearsal.
+
+2. BUILD AND DEPLOY BACKEND AND FRONTEND
+
+bash <<'ACCOUNTS_DEPLOY_SCRIPT'
+set -euo pipefail
+cd /mnt/apps/dockge/data/accounts-2026-use
+docker compose -f compose.yaml build --no-cache backend frontend
+docker compose -f compose.yaml up -d --no-deps --force-recreate backend frontend
+docker compose -f compose.yaml ps
+curl --fail --silent --show-error --retry 20 --retry-delay 3 --retry-all-errors http://127.0.0.1:30053/api/health
+printf '\n'
+ACCOUNTS_DEPLOY_SCRIPT
+
+Expected build: 2026.10.29-hmrc-sandbox-workbench-v1.5.1
+
+Open Accounts and select HMRC (test). Local cumulative previews work without
+credentials. Follow docs/HMRC-SANDBOX.md to create the sandbox application and
+generated test user, then set the optional environment variables in Dockge.
+Do not replace your live compose file with an example containing placeholder
+passwords. Do not use real Government Gateway credentials on the test journey.

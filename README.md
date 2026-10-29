@@ -1,6 +1,6 @@
 # Weddings By Mark Accounts 2026
 
-Current build: `2026.10.29-invoice-address-import-v1.5.0.4`
+Current build: `2026.10.29-hmrc-sandbox-workbench-v1.5.1`
 
 Independent, self-hosted accounts manager for Weddings By Mark. This is a secured successor to the existing application and has no Emergent runtime dependency.
 
@@ -48,3 +48,9 @@ The exact staging, backup, migration and verification sequence is in `TRUENAS-ST
 ## Booking integration
 
 The future integration contract is documented in `docs/BOOKING-INTEGRATION.md`. It is authenticated, idempotent and deliberately switched off. No booking records or client emails are affected by deploying this package.
+
+## HMRC test workspace
+
+Optional, disabled by default. Includes a local cumulative preview and a separate
+fictional-data sandbox workflow. No live filing or annual tax return submission
+is available. See [HMRC sandbox setup](docs/HMRC-SANDBOX.md).

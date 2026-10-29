@@ -12,6 +12,7 @@ import TaxPrep from "@/pages/TaxPrep";
 import TidyUp from "@/pages/TidyUp";
 import Mileage from "@/pages/Mileage";
 import CashFlow from "@/pages/CashFlow";
+import Hmrc from "@/pages/Hmrc";
 import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
 
@@ -66,6 +67,7 @@ function App() {
             <Route path="tidy-up" element={<TidyUp />} />
             <Route path="mileage" element={<Mileage />} />
             <Route path="cash-flow" element={<CashFlow />} />
+            <Route path="hmrc" element={<Hmrc />} />
           </Route>
         </Routes>
       </BrowserRouter>

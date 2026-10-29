@@ -33,6 +33,7 @@ from tax_year_close import (
 )
 from cash_flow import build_cash_flow_forecast, parse_date as parse_cash_flow_date
 from mileage_calculator import normalise_trip_miles
+from hmrc_mtd import create_router as create_hmrc_router
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -55,7 +56,7 @@ INTEGRATION_ENABLED = os.environ.get("BOOKING_INTEGRATION_ENABLED", "false").low
 INTEGRATION_KEY = os.environ.get("BOOKING_INTEGRATION_KEY", "")
 MAX_RESTORE_MB = max(1, int(os.environ.get("MAX_RESTORE_MB", "250")))
 MAX_UPLOAD_MB = max(1, int(os.environ.get("MAX_UPLOAD_MB", "50")))
-BUILD_ID = "2026.10.29-invoice-address-import-v1.5.0.4"
+BUILD_ID = "2026.10.29-hmrc-sandbox-workbench-v1.5.1"
 INVOICE_PDF_FORMAT_VERSION = 2
 
 # Create the main app. Documentation is disabled in production so financial
@@ -689,7 +690,9 @@ async def protect_application(request: Request, call_next):
     """
 
     path = request.url.path
-    public_api = {"/api/health", "/api/auth/login", "/api/auth/me"}
+    # OAuth callbacks use expiring, one-use server-side state and PKCE rather
+    # than a session cookie, which SameSite Strict omits on the HMRC redirect.
+    public_api = {"/api/health", "/api/auth/login", "/api/auth/me", "/api/hmrc/callback"}
 
     if path.startswith("/api/integrations/booking/"):
         if not _integration_authorised(request):
@@ -4431,6 +4434,7 @@ BACKUP_COLLECTIONS = [
     "expense_review_audit",
     "migration_audits",
     "cash_flow_commitments",
+    "hmrc_submissions",
 ]
 BACKUP_FILENAME_RE = re.compile(r"^weddings_by_mark_backup_\d{8}_\d{6}\.zip$")
 
@@ -4591,6 +4595,7 @@ async def restore_backup(file: UploadFile = File(...)):
 
 # Include the router
 app.include_router(api_router)
+app.include_router(create_hmrc_router(lambda: db, _tax_close_snapshot, APP_URL, BUILD_ID))
 
 app.add_middleware(
     CORSMiddleware,
@@ -4642,6 +4647,9 @@ if STATIC_DIR.exists():
 
 @app.on_event("startup")
 async def startup_checks():
+    await db.hmrc_submissions.create_index("id", unique=True, name="unique_hmrc_sample_review")
+    await db.hmrc_submissions.create_index("created_at", name="hmrc_sample_history")
+    await db.hmrc_oauth_states.create_index("cleanup_at", expireAfterSeconds=0, name="expire_hmrc_oauth_states")
     if APP_ENV == "production":
         if len(SESSION_SECRET) < 32:
             raise RuntimeError("SESSION_SECRET must be at least 32 characters in production")

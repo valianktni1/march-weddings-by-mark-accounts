@@ -26,6 +26,7 @@ const navItems = [
   { path: "/bank-statements", label: "Bank Statements", icon: Building2 },
   { path: "/transactions", label: "Transactions", icon: ArrowLeftRight },
   { path: "/tax-prep", label: "Tax Year Close", icon: Calculator },
+  { path: "/hmrc", label: "HMRC (test)", icon: Building2 },
   { path: "/tidy-up", label: "Tidy Up", icon: ListChecks },
   { path: "/cash-flow", label: "Cash Flow", icon: CalendarClock },
 ];
