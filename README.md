@@ -1,6 +1,6 @@
 # Weddings By Mark Accounts 2026
 
-Current build: `2026.08.28-booking-invoice-recreation-v1.5.0.3`
+Current build: `2026.10.29-invoice-address-import-v1.5.0.4`
 
 Independent, self-hosted accounts manager for Weddings By Mark. This is a secured successor to the existing application and has no Emergent runtime dependency.
 
